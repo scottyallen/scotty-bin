@@ -1,0 +1,16 @@
+#!/usr/bin/env ruby
+# Git checkout one or more files that are modified in your checkout. This is a thin wrapper around
+# the "gf" script. This adds a confirmation prompt before checking out.
+
+files = `#{File.dirname(__FILE__)}/gf #{ARGV.join(' ')}`.split(" ")
+
+if files.size > 0
+  puts files.map { |file| "  " + file}
+  print "Really git add these files? (y) "
+  answer = STDIN.gets.strip
+  if (answer == "y" || answer == "")
+    files.each { |file| `git add #{file}`}
+  end
+else
+  puts "No matches for #{ARGV[0]}"
+end

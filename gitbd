@@ -1,0 +1,10 @@
+#! /bin/bash
+
+git svn rebase -n || exit
+svn_branch=`git svn rebase -n |perl -ne 'print $1 if m#^Remote Branch: refs/remotes/(.*)$#;'`
+
+echo "svn_branch: $svn_branch"
+git checkout $svn_branch || exit
+for branch in `git branch --merged|perl -ne 'next if /^\*/; print'`; do
+  git branch -d $branch
+done

@@ -1,0 +1,33 @@
+#! /usr/bin/ruby
+
+# Does a binary search between two numbers, based on input from the user.
+# Useful for tracking down build breakages.  It will prompt you for two
+# endpoitns (cl numbers), and then ask you to try successive midpoint cls,
+# asking you if they're good or bad.
+
+def midpoint(s, e)
+  return (e - s) / 2 + s
+end
+
+def getNumber
+  return gets.chomp.to_i
+end
+
+def main
+  puts "Start number:"
+  s = getNumber()
+  puts "End number:"
+  e = getNumber()
+  while true
+    mid = midpoint(s, e)
+    puts "Breakage between #{s} - #{e}. Does #{mid} work? (y/n):"
+    answer = gets.chomp
+    if answer == 'y'
+      s = mid
+    elsif answer == 'n'
+      e = mid
+    end
+  end
+end
+
+main()

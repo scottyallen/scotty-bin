@@ -1,0 +1,9 @@
+#! /bin/bash
+
+PREFIX="$1"
+SUBJECT=`git log -1 --pretty=format:%s`
+echo "$PREFIX $SUBJECT" > .message
+echo >> .message
+git log -1 --pretty=format:%b >> .message
+git commit --amend -F .message
+rm .message

@@ -1,0 +1,4 @@
+#! /bin/bash
+#egrep -rl ' +$' *|egrep '\.(as|xml|mxml|rb|html|rhtml|rxml)$'|xargs perl -pi -e 's/ +$//g;'
+#find . | egrep '\.(as|xml|mxml|rb|html|rhtml|rxml)$'|xargs perl -pi -e 's/ +$//g;'
+find -E . -iregex '\./[^\.].*\.(as|xml|mxml|rb|html|rhtml|rxml)' | xargs perl -pi -e 's/ +$//g;'

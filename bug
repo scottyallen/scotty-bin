@@ -1,0 +1,55 @@
+#! /usr/bin/env bash
+
+JIRA_EMAIL='jira+%s@ooyala.com'
+USAGE='Usage: bug [-s summary] [-a assign-username] project-code'
+
+while getopts 's:a:' OPTION
+do
+  case $OPTION in
+  s) summary="$OPTARG"
+      ;;
+  a) assign="$OPTARG"
+      ;;
+  ?) echo $USAGE
+     exit 1
+      ;;
+  esac
+done
+shift $(($OPTIND - 1))
+
+project=$1
+if [[ -z "$project" ]]
+then
+  echo $USAGE
+  exit 1
+fi
+
+project_email=`printf $JIRA_EMAIL $project`
+
+FILENAME=/tmp/bug.$$
+BODY_FILENAME=/tmp/bug-body.$$
+
+echo "Summary: $summary" > $FILENAME
+echo >> $FILENAME
+echo "Description" >> $FILENAME
+
+$EDITOR $FILENAME
+
+perl -ne 'print if $i++ > 1' $FILENAME > $BODY_FILENAME
+summary=`perl -ne 'print $1 if $i++ == 0 and /^Summary: (.*)/' $FILENAME`
+
+if [[ -z "$summary" ]]
+then
+  echo "A summary must be provided."
+  exit 1
+fi
+
+if [[ -n "$assign" ]]
+then
+  cc_option="-c $assign@ooyala.com"
+fi
+
+cat $BODY_FILENAME| mail -s "$summary" $cc_option $project_email
+#echo mail -s "$summary" $cc_option $project_email
+echo "Bug created."
+rm $FILENAME $BODY_FILENAME

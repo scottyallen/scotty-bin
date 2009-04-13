@@ -1,0 +1,4 @@
+#!/bin/sh
+echo opendiff "$2" "$1"
+opendiff "$2" "$1" &
+sleep 1

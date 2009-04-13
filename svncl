@@ -1,0 +1,44 @@
+#! /usr/bin/ruby
+
+require 'getoptlong.rb'
+
+def create
+  clName = $*[1]
+  for line in `svn st` do
+    if (line =~ /^--- Changelist /)
+      break
+    end
+    if (line.strip != '')
+      tokens = line.split(' ')
+      action, filename = tokens[0], tokens[-1]
+      if (action != '?')
+        runCommand("svn cl #{clName} #{filename}")
+      end
+    end
+  end
+end
+
+def runCommand(command)
+  if (@dry_run)
+    puts command
+  else
+    system(command)
+  end
+end
+
+@dry_run = false
+parser = GetoptLong.new
+parser.set_options(
+    ['--dry-run', '-n', GetoptLong::NO_ARGUMENT]
+)    
+parser.each do |name, arg|
+  puts "arg: #{name}=#{arg}"
+  if (name == '--dry-run')
+    @dry_run = true
+  end
+end
+command = $*[0]
+if (command == "create")
+  create()
+end
+

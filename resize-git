@@ -1,0 +1,4 @@
+#! /bin/bash
+
+/usr/bin/perl -pi -e 's/^set geometry\(.*?\n//' ~/.gitk
+/usr/bin/perl -pi -e 's/^\[gui\]\n//; s/^\s*geometry.*\n//' .git/config

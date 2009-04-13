@@ -1,0 +1,23 @@
+#! /bin/bash
+
+if [[ "$1" == "off" ]]
+then
+  echo "Turning off packet loss"
+  ipfw delete 42
+  ipfw pipe delete 42
+fi
+
+if [[ "$1" == "on" ]]
+then
+  echo "Turning on packet loss"
+  ipfw delete 42
+  ipfw pipe delete 42
+  ipfw pipe 42 config plr $2
+  ipfw add 42 pipe 42 ip from any to any iplen 1000-3000
+fi
+
+if [[ "$1" == "show" ]]
+then
+  ipfw show
+  ipfw pipe show
+fi

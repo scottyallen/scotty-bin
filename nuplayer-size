@@ -1,0 +1,31 @@
+#! /bin/bash
+
+modules='ads analytics channels controls end_screen ivideo playback shelf start_screen ui watermark'
+startup_modules='playback start_screen'
+
+cd ooyala-web-rails/public
+player_size=`ls -l player_v2.swf|awk '{print $5}'`
+echo "Player swf: $player_size"
+echo
+
+modules_total=0
+for module in $modules
+do
+  module_size=`ls -lt modules/$module-*.swf|grep -v debug.swf|head -1|awk '{print $5}'`
+  echo "$module: $module_size"
+  modules_total=$(($modules_total + $module_size))
+done
+
+echo
+
+startup_modules_total=0
+for module in $startup_modules
+do
+  module_size=`ls -lt modules/$module-*.swf|grep -v debug.swf|head -1|awk '{print $5}'`
+  startup_modules_total=$(($startup_modules_total + $module_size))
+done
+
+echo "Total required for the start of simple playback (player + playback + start screen): " $(($startup_modules_total + $player_size))
+echo "Total: " $(($modules_total + $player_size))
+
+required_modules_size=0

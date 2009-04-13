@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# figures out what type of connection this is and returns ssh, telnet, local, or xwindows
+THIS_TTY=`ps aux | grep $$ | grep bash | awk '{ print $7 }'`
+SESS_SRC=`who | grep ' $THIS_TTY ' | awk '{ print $6 }'`
+
+SSH_FLAG=0
+SSH_IP=`echo $SSH_CLIENT | awk '{ print $1 }'`
+if [ $SSH_IP ] ; then
+  SSH_FLAG=1
+fi
+SSH2_IP=`echo $SSH2_CLIENT | awk '{ print $1 }'`
+if [ $SSH2_IP ] ; then
+  SSH_FLAG=1
+fi
+if [ $SSH_FLAG -eq 1 ] ; then
+  CONN=ssh
+elif [ -z "$SESS_SRC" ] ; then
+  CONN=local
+elif [ "$SESS_SRC" = "(:0.0)" -o "$SESS_SRC" = "" ] ; then
+  CONN=xwindows
+else
+  CONN=telnet
+fi
+
+echo $CONN

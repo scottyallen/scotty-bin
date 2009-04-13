@@ -1,0 +1,12 @@
+#! /bin/bash
+
+NUM_LEFT=$((`cat $1 | wc -l` - 1))
+TEMP_FILE=`dirname $1`/.`basename $1`.tmp
+if (($NUM_LEFT >= 0))
+then
+  head -n 1 $1
+  tail -n $NUM_LEFT $1 > $TEMP_FILE
+  mv $TEMP_FILE $1
+else
+  echo "No more lines left!" >&2
+fi
