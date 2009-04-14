@@ -1,6 +1,6 @@
 #!/usr/bin/env ruby
-# Git checkout one or more files that are modified in your checkout. This is a thin wrapper around
-# the "gf" script. This adds a confirmation prompt before checking out.
+# Git add one or more files that are modified in your checkout. This is a thin wrapper around
+# the "gf" script. This adds a confirmation prompt before adding.
 
 files = `#{File.dirname(__FILE__)}/gf #{ARGV.join(' ')}`.split(" ")
 

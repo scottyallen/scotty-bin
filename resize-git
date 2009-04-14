@@ -1,4 +1,6 @@
 #! /bin/bash
 
+# Resizes git gui and gitk when they're too big to fit on the screen.
+
 /usr/bin/perl -pi -e 's/^set geometry\(.*?\n//' ~/.gitk
 /usr/bin/perl -pi -e 's/^\[gui\]\n//; s/^\s*geometry.*\n//' .git/config

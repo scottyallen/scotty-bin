@@ -1,5 +1,7 @@
 #!/bin/sh
 
+# Formats the current working directory for use as part of a bash prompt.
+
 pwd_length=25
 
 DIR=`pwd`

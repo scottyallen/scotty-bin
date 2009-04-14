@@ -1,5 +1,7 @@
 #! /bin/bash
 
+# Remove the first line from a file and print it to stdout.
+
 NUM_LEFT=$((`cat $1 | wc -l` - 1))
 TEMP_FILE=`dirname $1`/.`basename $1`.tmp
 if (($NUM_LEFT >= 0))

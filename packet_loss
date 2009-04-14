@@ -1,5 +1,14 @@
 #! /bin/bash
 
+# Configures a variable amount of packet loss on OS X.
+#
+# Usage:
+#
+#   Turn on 10% packet loss:
+#     sudo packet_loss on 0.10 
+#   Turn off packet loss:
+#     sudo packet_loss off
+
 if [[ "$1" == "off" ]]
 then
   echo "Turning off packet loss"
