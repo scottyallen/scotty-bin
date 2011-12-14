@@ -1,0 +1,10 @@
+#! /bin/bash
+
+repo=`git remote show -n origin|perl -nle 'print $1 if /Fetch URL: .*:(.*).git/'`
+if [[ "$repo" == "" ]]
+then
+  exit
+fi
+url=http://github.com/$repo
+echo "Opening $url..."
+open $url
