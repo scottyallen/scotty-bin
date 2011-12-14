@@ -1,0 +1,14 @@
+#!/bin/bash
+#
+# ssh into a machine and automatically set the iterm2 tab name to the hostname
+#
+# Installation:
+# 1. Save this script to /some/bin/ssh-tab-name
+# 2. chmod 755 /some/bin/ssh-tab-name
+# 3. alias ssh=/some/bin/ssh-tab-name
+
+echo -e "\033];${!#}\007"
+
+ssh $@
+
+echo -e "\033];localhost\007"
