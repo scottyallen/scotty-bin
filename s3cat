@@ -1,0 +1,4 @@
+#!/bin/bash
+
+s3cmd get --no-progress $1 /tmp/$$.tmp 1>/dev/null
+cat /tmp/$$.tmp
