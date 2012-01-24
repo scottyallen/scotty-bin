@@ -1,4 +1,12 @@
 #!/bin/bash
 
-s3cmd get --no-progress $1 /tmp/$$.tmp 1>/dev/null
-cat /tmp/$$.tmp
+S3_URL=$1
+BUCKET=$(echo $S3_URL|sed 's/s3:\/\///; s/\/.*//')
+KEY=$(echo $S3_URL|sed 's/s3:\/\/[^/]*//')
+EXPIRES=$((`date +'%s'` + 3600))
+STR_TO_SIGN=$(printf "GET\n\n\n$EXPIRES\n/$BUCKET$KEY")
+SIGNATURE=`s3cmd sign "$STR_TO_SIGN" | awk '{print $2}'|sed 's/\//%2f/g; s/+/%2b/g;'`
+
+ACCESS_KEY=$(grep -i access_key ~/.s3cfg|awk '{print $3}')
+
+curl -s "http://$BUCKET.s3.amazonaws.com$KEY?AWSAccessKeyId=$ACCESS_KEY&Expires=$EXPIRES&Signature=$SIGNATURE"
