@@ -5,6 +5,16 @@ if [[ "$repo" == "" ]]
 then
   exit
 fi
-url=http://github.com/$repo
+if [[ -e "$1" ]]
+then
+  branch=$(git symbolic-ref -q HEAD)
+  branch=${branch##refs/heads/}
+  url=http://github.com/$repo/commits/$branch/$1
+elif [[ "$1" != "" ]]
+then
+  url=http://github.com/$repo/commit/$1
+else
+  url=http://github.com/$repo
+fi
 echo "Opening $url..."
 open $url
