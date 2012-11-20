@@ -20,7 +20,7 @@ end
 git_path = File.expand_path(git_path.join("/"))
 
 puts "Appending these lines to git-ignore:"
-File.open("#{git_path}/.git/info/exclude", "a") do |git_ignore|
+File.open("#{git_path}/.gitignore", "a") do |git_ignore|
   ARGV.each do |filename|
     # Expand the path of filename to resolve any relative "/tmp/../tmp/" path junk, so the lines we add
     # to .git-ignore will be clean and minimal.
