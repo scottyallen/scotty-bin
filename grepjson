@@ -1,0 +1,29 @@
+#! /usr/bin/python2.6
+import re
+import sys
+
+import json
+
+field_name, value = None, None
+if '=' in sys.argv[1]:
+  field_name, value = sys.argv[1].split('=')
+else:
+  field_name = sys.argv[1]
+
+filehandles = [sys.stdin]
+if len(sys.argv) > 2:
+  filehandles = []
+  for filename in sys.argv[2:]:
+    filehandles.append(open(filename))
+for fh in filehandles:
+  for line in fh:
+    j = json.loads(line)
+    if value is not None:
+      if re.search(value, str(j[field_name])):
+        print line,
+    else:
+      field_value = j.get(field_name, '')
+      if isinstance(field_value, basestring):
+        print field_value.encode('utf-8')
+      else:
+        print field_value
