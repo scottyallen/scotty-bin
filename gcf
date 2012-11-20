@@ -9,7 +9,7 @@ if files.size > 0
   print "Really git checkout these files? (y) "
   answer = STDIN.gets.strip
   if (answer == "y" || answer == "")
-    files.each { |file| `git checkout head #{file}`}
+    files.each { |file| `git checkout HEAD #{file}`}
   end
 else
   puts "No matches for #{ARGV[0]}"
