@@ -1,6 +1,9 @@
 #! /usr/bin/python
 
+import codecs
 import xml.dom.minidom
 import sys
 
-xml.dom.minidom.parse(sys.stdin).writexml(sys.stdout, addindent="  ", newl="\n")
+sys.stdout = codecs.getwriter('utf-8')(sys.stdout)
+doc = xml.dom.minidom.parse(sys.stdin)
+doc.writexml(sys.stdout, addindent="  ", newl="\n")
