@@ -39,18 +39,21 @@ gui=
 opts=
 
 # GUI mode, implies forking
-case "$name" in m*|g*|rg*) gui=true ;; esac
+case "$name" in m*|g*|rm*|rg*) gui=true ;; esac
 
 # Restricted mode
 case "$name" in r*) opts="$opts -Z";; esac
 
-# vimdiff and view
+# vimdiff, view, and ex mode
 case "$name" in
 	*vimdiff)
 		opts="$opts -dO"
 		;;
 	*view)
 		opts="$opts -R"
+		;;
+	*ex)
+		opts="$opts -e"
 		;;
 esac
 
@@ -63,11 +66,7 @@ if [ "$gui" ]; then
 	# terminal instead of the console log.
 	# But if you use open instead, you will need to fully qualify the
 	# path names for any filenames you specify, which is hard.
-  if $tabs && [[ `$binary --serverlist` = "VIM" ]]; then
-    exec "$binary" -g $opts --remote-tab-silent ${1:+"$@"}
-  else
-    exec "$binary" -g $opts ${1:+"$@"}
-  fi
+	exec "$binary" -g $opts ${1:+"$@"}
 else
-  exec "$binary" $opts ${1:+"$@"}
+	exec "$binary" $opts ${1:+"$@"}
 fi
