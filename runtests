@@ -1,0 +1,46 @@
+#! /bin/bash
+
+if [ -f $1 ]
+then
+  INPUT_TYPE="file"
+  testcase=$2
+elif [ -d $1 ]
+then
+  INPUT_TYPE="dir"
+else
+  echo "Input is not a directory or a file"
+  exit
+fi
+
+if [ $2 ]
+then
+  TARGET=$2
+else
+  TARGET=nosetest_only
+fi
+
+input=$1
+
+COUNT=0
+while [ "1" ]
+do
+  echo -n "Run $COUNT..."
+  COUNT=$(($COUNT + 1))
+  if [ "$INPUT_TYPE" == "dir" ]
+  then
+    OUTPUT=`make -C $input $TARGET 2>&1`
+  else
+    OUTPUT=`python $* 2>&1`
+  fi
+  if [ "$?" == "0" ]
+  then
+    echo -en "\033[32m"
+    echo "OK"
+    echo -en "\033[0m"
+  else
+    echo -en "\033[31m"
+    echo "FAILED"
+    echo -en "\033[0m"
+    echo "$OUTPUT"
+  fi
+done
