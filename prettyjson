@@ -1,0 +1,10 @@
+#! /usr/bin/python
+
+import json
+import sys
+
+input = sys.stdin.read()
+try:
+  print json.dumps(json.loads(input), sort_keys=True, indent=2)
+except ValueError:
+  print "Couldn't decode input:\n%s" % input
