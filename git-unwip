@@ -1,0 +1,10 @@
+#! /bin/bash
+
+desc=`git log --pretty=format:'%s' -n 1`
+
+if [ "$desc" == "WIP" ]
+then
+ git reset HEAD^
+else
+ echo "The latest commit is not WIP"
+fi
