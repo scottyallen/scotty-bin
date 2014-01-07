@@ -1,0 +1,21 @@
+#! /bin/bash
+
+REGEX=$1
+shift
+FILES=$@
+
+FILENAMES=`ls -1 $FILES`
+for filename in `ls -1 $FILES`
+do
+  new_name=`echo $filename | perl -pe "$REGEX"`
+  if [[ "$new_name" != "$filename" ]]
+  then
+    echo mv $filename $new_name
+    if [[ -f "$new_name" ]]
+    then
+      echo "File $new_name exists."
+      exit
+    fi
+    mv $filename $new_name
+  fi
+done
