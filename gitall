@@ -1,0 +1,12 @@
+#! /bin/bash
+
+starting_dir=$PWD
+for git_file in `find . -name .git`
+do
+  dir=`dirname $git_file`
+  cd $dir
+  echo
+  echo $dir
+  git $*
+  cd $starting_dir
+done
