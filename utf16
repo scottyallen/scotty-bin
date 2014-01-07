@@ -1,0 +1,4 @@
+#! /bin/bash
+
+python -c 'import sys; sys.stdout.write("\xff\xfe")'
+iconv -f utf-8 -t utf-16le $1
