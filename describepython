@@ -1,0 +1,252 @@
+#! /usr/bin/env python
+
+import subprocess
+import optparse
+import os
+import sys
+
+__version__ = "1.0.0"
+__author__ = "Jeet Sukumaran"
+
+class cached_property(object):
+    """
+    Lazy-loading read/write property descriptor.
+    Value is stored locally in descriptor object. If value is not set when
+    accessed, value is computed using given function. Value can be cleared
+    by calling 'del'.
+    """
+
+    def __init__(self, func):
+        self._func = func
+        self._values = {}
+        self.__name__ = func.__name__
+        self.__doc__ = func.__doc__
+
+    def __get__(self, obj, obj_class):
+        if obj is None:
+            return obj
+        if obj not in self._values \
+                or self._values[obj] is None:
+            self._values[obj] = self._func(obj)
+        return self._values[obj]
+
+    def __set__(self, obj, value):
+        self._values[obj] = value
+
+    def __delete__(self, obj):
+        if self.__name__ in obj.__dict__:
+            del obj.__dict__[self.__name__]
+        self._values[obj] = None
+
+class PythonEnvironment(object):
+    """
+    Wraps interrogation of a particular Python interpreter (i.e., Python compiler/
+    interpreter binary) for information.
+    """
+
+    def __init__(self, python_interpreter='python'):
+        self._python_interpreter = None
+        self.python_interpreter = python_interpreter
+
+    def _get_python_interpreter(self):
+        return self._python_interpreter
+
+    def _set_python_interpreter(self, p):
+        if not p or p is None:
+            raise ValueError("Python interpreter path cannot be empty")
+        self._python_interpreter = p
+
+    python_interpreter = property(_get_python_interpreter, _set_python_interpreter)
+
+    def _exec_python(self, cmd, first_line_only=True, default=None, exit_on_fail=True):
+        try:
+            p = subprocess.Popen([self.python_interpreter, "-c", cmd], shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError:
+            sys.exit("'%s' is not a valid Python interpreter" % self.python_interpreter)
+        result = p.stdout.readlines()
+        if result:
+            if first_line_only:
+                return result[0].decode("utf-8").replace('\n', '')
+            else:
+                return [r.decode("utf-8").replace('\n', '') for r in result]
+        else:
+            e = p.stderr.read()
+            if e and exit_on_fail:
+                sys.exit(e)
+            else:
+                return default
+
+    def prefetch(self):
+        code = r"""
+import sys
+import platform
+from distutils.sysconfig import get_python_lib
+print("executable$$$%s" % sys.executable)
+try:
+    print("prefix$$$%s" % sys.prefix)
+except AttributeError:
+    print("prefix$$$")
+print("site_packages$$$%s" % get_python_lib())
+try:
+    print("implementation$$$%s" % platform.python_implementation())
+except AttributeError:
+    print("implementation$$$???")
+print("version_short$$$%s" % ('.'.join([str(s) for s in sys.version_info])))
+print("version_long$$$%s" % (sys.version.replace('\n', ': ')))
+print("version$$$%s" % platform.python_version())
+print("site_packages$$$%s" % get_python_lib())
+try:
+    print("branch$$$%s" % platform.python_branch())
+except AttributeError:
+    print("branch$$$???")
+try:
+    print("revision$$$%s" % platform.python_revision())
+except AttributeError:
+    print("revision$$$???")
+print("build_date$$$%s" % (platform.python_build()[1]))
+print("compiler$$$%s" % platform.python_compiler())
+"""
+        result = self._exec_python(code, first_line_only=False)
+        for line in result:
+            key, value = line.split('$$$')
+            setattr(self, key, value)
+
+    @cached_property
+    def executable(self):
+        return self._exec_python(r"import sys; print(sys.executable)")
+
+    @cached_property
+    def prefix(self):
+        return self._exec_python(r"import sys; print(sys.prefix)",
+                default="",
+                exit_on_fail=False)
+
+    @cached_property
+    def site_packages(self):
+        return self._exec_python(r"from distutils.sysconfig import get_python_lib; print(get_python_lib())")
+
+    @cached_property
+    def sys_path(self):
+        sp = self._exec_python(r"import sys; print('\n'.join(sys.path))", first_line_only=False)
+        return sp
+
+    @cached_property
+    def implementation(self):
+        return self._exec_python(r"import platform; print(platform.python_implementation())",
+                default="???",
+                exit_on_fail=False)
+
+    @cached_property
+    def version_short(self):
+        return self._exec_python(r"import sys; print('.'.join([str(s) for s in sys.version_info]))")
+
+    @cached_property
+    def version_long(self):
+        return self._exec_python(r"import sys; print(sys.version.replace('\n', ': '))")
+
+    @cached_property
+    def version(self):
+        return self._exec_python(r"import platform; print(platform.python_version())")
+
+    @cached_property
+    def branch(self):
+        return self._exec_python(r"import platform; print(platform.python_branch())",
+                default="???",
+                exit_on_fail=False)
+
+    @cached_property
+    def revision(self):
+        return self._exec_python(r"import platform; print(platform.python_revision())",
+                default="???",
+                exit_on_fail=False)
+
+    @cached_property
+    def build_date(self):
+        return self._exec_python(r"import platform; print(platform.python_build()[1])")
+
+    @cached_property
+    def compiler(self):
+        return self._exec_python(r"import platform; print(platform.python_compiler())")
+
+    @cached_property
+    def title(self):
+        try:
+            p = subprocess.Popen([self.python_interpreter, "-V"], shell=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        except OSError:
+            sys.exit("'%s' is not a valid Python interpreter" % self.python_interpreter)
+        result = p.stderr.readlines()
+        if result:
+            return result[0].decode("utf-8").replace('\n', '')
+        else:
+            result = p.stdout.read()
+            if result:
+                return result.decode("utf-8").replace('\n', ' ')
+            else:
+                return "???"
+
+if __name__ == "__main__":
+
+    parser = optparse.OptionParser(
+        usage="%prog [options] [python]",
+        description="""\
+Describe the paths and implementation details of the environment of a Python
+installation."""
+        )
+
+    parser.add_option('-e', '--executable',
+            action="store_true",
+            help="show full path to Python interpreter executable and exit")
+
+    parser.add_option('-v', '-V', '--version',
+            action="store_true",
+            help="show Python version and exit")
+
+    parser.add_option('-p', '--prefix',
+            action="store_true",
+            help="show full path to Python installation prefix and exit")
+
+    parser.add_option('-s', '--site-packages',
+            action="store_true",
+            help="show full path to Python site package directory and exit")
+
+    parser.add_option('-d', '--build-date',
+            action="store_true",
+            help="show Python build information and exit")
+
+    parser.add_option('-b', '--build-info',
+            action="store_true",
+            help="show Python build information and exit")
+
+    opts, args = parser.parse_args()
+
+    if len(args) == 0:
+        pe = PythonEnvironment('python')
+    else:
+        pe = PythonEnvironment(args[0])
+
+    if opts.executable:
+        print(pe.executable)
+    elif opts.version:
+        print(pe.version_short)
+    elif opts.prefix:
+        print(pe.prefix)
+    elif opts.site_packages:
+        print(pe.site_packages)
+    elif opts.build_date:
+        print(pe.build_date)
+    elif opts.build_info:
+        pe.prefetch()
+        print("%s %s:%s built on %s by %s" % (pe.implementation, pe.branch, pe.revision, pe.build_date, pe.compiler))
+    else:
+        pe.prefetch()
+        print("[%s]"% (pe.title))
+        print("         Executable: %s" % (pe.executable))
+        print("            Version: %s" % (pe.version_short))
+        print("Installation Prefix: %s" % (pe.prefix))
+        print("      Site Packages: %s" % (pe.site_packages))
+        print("     Implementation: %s" % (pe.implementation))
+        print("             Branch: %s" % (pe.branch))
+        print("           Revision: %s" % (pe.revision))
+        print("           Compiler: %s" % (pe.compiler))
+        print("         Build Date: %s" % (pe.build_date))
+
