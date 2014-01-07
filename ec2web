@@ -1,0 +1,3 @@
+#! /bin/bash
+
+open https://console.aws.amazon.com/ec2/home
