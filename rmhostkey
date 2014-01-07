@@ -1,0 +1,7 @@
+#!/bin/bash
+
+FILE="$HOME/.ssh/known_hosts"
+HOSTNAME=`python -c "print '$1'.replace('.', '\\.')"`
+
+sed -i .bak "/^$HOSTNAME /d" "$FILE"
+diff -U0 "$FILE.bak" "$FILE"
