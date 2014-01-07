@@ -1,0 +1,6 @@
+#! /bin/bash
+
+HOST=$1
+
+scp ~/.screenrc $HOST:
+scp ~/.vimrc $HOST:
