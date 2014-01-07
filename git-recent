@@ -1,0 +1,9 @@
+#! /bin/bash
+
+for branch in `git reflog|grep checkout|perl -nle 'print $1 if /.* moving from (.*) to .*/'|ouniq|head -n20`
+do
+  if git branch |cut -b 3-|grep "$branch" > /dev/null
+  then
+    echo $branch
+  fi
+done
