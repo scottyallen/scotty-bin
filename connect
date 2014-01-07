@@ -1,0 +1,35 @@
+#! /usr/bin/osascript
+
+tell application "iTerm"
+    set myterm to (make new terminal)
+    tell myterm
+        activate current session
+        launch session "Default Session"
+        tell the last session
+            write text "killssh"
+            write text "ssh compute"
+        end tell
+        launch session "Default Session"
+
+        tell the last session
+            write text "killssh"
+            write text "ssh compute2"
+        end tell
+
+        launch session "Default Session"
+        tell the last session
+            write text "ssh build"
+        end tell
+
+        launch session "Default Session"
+        tell the last session
+            write text "ssh -L 27018:localhost:27017 android-mongodb.appmonsta.com"
+        end tell
+
+        launch session "Default Session"
+        tell the last session
+            write text "ssh -L 6380:localhost:6379 redis.appmonsta.com"
+        end tell
+    end tell
+    set miniaturized of window 1 to true
+end tell
