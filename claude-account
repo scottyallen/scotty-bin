@@ -529,6 +529,30 @@ def write_browser_cookies(rows):
     con.close()
 
 
+def jar_matches_other_profile(name, rows):
+  """The profile whose saved sessionKey the jar's row matches, or None.
+
+  Only a positive match means anything. Chrome's cookie encryption here is
+  deterministic, so identical plaintext gives identical ciphertext and a match
+  is proof the jar belongs to that other account - but a jar matching nothing
+  saved may still be the right account with a session that has since rotated,
+  so no match is not evidence of correctness. Compares base64 as stored; never
+  decrypts, so it never touches the Chrome Safe Storage keychain entry (reading
+  that pops a blocking GUI auth prompt).
+  """
+  jar_key = next((r.get("encrypted_value") for r in rows
+                  if r.get("name") == "sessionKey"), None)
+  if not jar_key:
+    return None
+  for other in list_profile_names():
+    if other == name:
+      continue
+    for r in (read_browser_snapshot(other) or {}).get("sqlite") or []:
+      if r.get("name") == "sessionKey" and r.get("encrypted_value") == jar_key:
+        return other
+  return None
+
+
 def browser_snapshot(name, quiet=False, expected_org=None, cdp_cookies=None):
   """Capture the live claude.ai browser session into profile `name`.
 
@@ -575,6 +599,21 @@ def browser_snapshot(name, quiet=False, expected_org=None, cdp_cookies=None):
 
   rows = read_browser_cookies()
   if rows:
+    # The org guard above can only run when DevTools handed us plaintext. With
+    # Chrome stopped there is no CDP form, and the jar's values are Safe-Storage
+    # encrypted, so the account behind them can't be read directly. A byte
+    # comparison still catches the common case: Chrome's cookie encryption here
+    # is deterministic, so the same session yields the same ciphertext, and a
+    # jar whose sessionKey matches a DIFFERENT profile's saved one demonstrably
+    # isn't this account's.
+    owner = jar_matches_other_profile(name, rows)
+    if owner:
+      if not quiet:
+        print(yellow(f"note: the on-disk cookie jar holds {owner}'s session, "
+                     f"not {name}'s; browser session NOT saved (a previous "
+                     f"`switch --no-browser` leaves the browser on another "
+                     f"account)"))
+      return False
     payload["sqlite"] = rows
 
   names = {c["name"] for c in payload.get("cdp", [])} \
@@ -710,6 +749,11 @@ def browser_switch(name, outgoing):
   # outgoing profile keeps only its SQLite rows. That costs it the no-restart
   # path until it is re-saved against a live browser, which is why this only
   # happens when Chrome was already closed.
+  #
+  # The account behind those rows can't be read (they're encrypted), so this
+  # snapshot is verified only as far as jar_matches_other_profile() can reach:
+  # a jar holding some other profile's known session is caught, a jar holding
+  # an account we have never saved is not.
   if outgoing and outgoing != name:
     if browser_snapshot(outgoing, quiet=True,
                         expected_org=outgoing_org(outgoing)):
