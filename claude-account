@@ -538,8 +538,9 @@ def browser_snapshot(name, quiet=False, expected_org=None, cdp_cookies=None):
   alone is enough to restore.
 
   `cdp_cookies` lets a caller hand in a CDP form it read earlier. browser_switch
-  needs this: it can only snapshot the outgoing account after quitting Chrome,
-  and cdp_connect() cannot reach a dead browser.
+  passes the cookies it read over its own connection, so snapshotting the
+  outgoing account costs no second connection - and therefore no second Chrome
+  "Allow remote debugging?" dialog.
 
   Best-effort: if Chrome isn't set up or isn't logged into claude.ai, we warn and
   move on rather than failing the whole save - the CLI token is the primary
@@ -665,27 +666,21 @@ def browser_switch(name, outgoing):
     try:
       # Preserve the outgoing account's freshest cookies first - reading from
       # memory means we catch a session that rotated since the last save.
+      #
+      # Hand them to browser_snapshot() rather than writing the keychain here.
+      # It owns every guard a snapshot needs (it must carry a sessionKey, and
+      # its org must match the profile's), and an inlined copy of the write
+      # silently loses them: an empty read from a logged-out browser would
+      # overwrite a good CDP form with [] and still report success - the very
+      # ratchet this file exists to avoid.
       if outgoing and outgoing != name:
-        out_cdp = cdp_get_identity_cookies(ws)
-        # Same wrong-account guard as `save`: the browser may be logged into
-        # someone other than the outgoing CLI account (a previous
-        # `switch --no-browser` does exactly that), and saving those cookies
-        # would overwrite the outgoing profile with a stranger's session.
-        exp_org = outgoing_org(outgoing)
-        live_org = next((c["value"] for c in out_cdp
-                         if c["name"] == "lastActiveOrg"), None)
-        if exp_org and live_org and live_org != exp_org:
-          print(yellow(f"note: the browser is logged into org {live_org}, not "
-                       f"{outgoing}'s org {exp_org}; {outgoing}'s saved "
-                       f"session left untouched"))
-        else:
-          out_snap = read_browser_snapshot(outgoing) or {}
-          out_snap.update({"savedAt": int(time.time()),
-                           "profileDir": CHROME_PROFILE_DIR,
-                           "cdp": out_cdp})
-          out_snap.pop("cookies", None)
-          keychain_write(browser_service(outgoing), json.dumps(out_snap))
+        if browser_snapshot(outgoing, quiet=True,
+                            expected_org=outgoing_org(outgoing),
+                            cdp_cookies=cdp_get_identity_cookies(ws)):
           print(dim(f"(snapshotted outgoing browser session -> {outgoing})"))
+        else:
+          print(yellow(f"note: outgoing browser session not snapshotted; "
+                       f"{outgoing}'s saved session is unchanged"))
 
       if cdp_set_cookies(ws, snap["cdp"]):
         print(green("switched") + f" browser session to {bold(name)}"
