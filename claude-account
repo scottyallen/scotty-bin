@@ -121,6 +121,11 @@ API_URL = "https://api.anthropic.com/v1/messages"
 # Cloudflare rule that answers "error code: 1010" for non-browser clients.
 OAUTH_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
 OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Who does a credential belong to? The keychain blob answers only "what tokens",
+# never "whose account" - it carries no uuid and no email - so the only way to
+# tie a blob to an account is to spend it. The `user:profile` scope every Claude
+# Code credential holds covers exactly this call.
+OAUTH_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 # Probing with Fable is what makes the API return the extra 7d_oi bucket (the
 # separate weekly quota for premium models). Haiku only yields 5h/7d.
 PROBE_MODEL = "claude-fable-5"
@@ -1136,6 +1141,34 @@ def http_get_json(url, api_key):
     return None, "unparseable response"
 
 
+def verified_identity(blob):
+  """Ask the API which account a credential blob belongs to.
+
+  Returns an oauthAccount-shaped dict, or (None, error) if the question can't
+  be answered - offline, or a token too dead to spend. This is the only source
+  of identity that is actually tied to the credential: ~/.claude.json's
+  oauthAccount is written by whoever ran last and can describe a different
+  account than the keychain holds.
+  """
+  token = access_token(blob)
+  if not token:
+    return None, "no access token in the credential blob"
+  payload, error = http_get_json(OAUTH_PROFILE_URL, token)
+  if not payload:
+    return None, error
+  account = payload.get("account") or {}
+  org = payload.get("organization") or {}
+  if not account.get("uuid"):
+    return None, "profile response carried no account uuid"
+  return {
+      "emailAddress": account.get("email"),
+      "accountUuid": account.get("uuid"),
+      "organizationUuid": org.get("uuid"),
+      "organizationName": org.get("name"),
+      "organizationType": org.get("organization_type"),
+  }, ""
+
+
 def _glm_window_label(reset_epoch_s):
   """Bucket a quota window's reset time into a 5h/7d/30d label."""
   delta = reset_epoch_s - time.time()
@@ -1262,19 +1295,53 @@ def snapshot(name, quiet=False, force=False, with_browser=True):
   one you last switched to. Without this guard, a `save` issued at the wrong
   moment silently overwrites a profile's token with a different account's and
   destroys the only copy (that is exactly how claude2 was lost on 2026-07-23).
+
+  The identity is resolved from the credential itself, via the API. It used to
+  come from ~/.claude.json, which is cosmetic and written by whatever ran last:
+  anything that touched that file could make the guard compare the wrong pair
+  and wave through the overwrite it exists to stop, while also stamping the
+  wrong identity into the profile's metadata. That is not hypothetical - it
+  happened on 2026-07-25 and left two profiles both claiming one account.
+
+  When the API can't be reached, an existing profile is not overwritten at all:
+  unverifiable is treated as unsafe, because the failure being guarded against
+  destroys the only local copy of a credential.
   """
   blob = keychain_read(LIVE_SERVICE)
   if not blob:
     die("no live Claude credential found in the keychain - is `claude` "
         "logged in? Run /login first.")
-  oauth = current_oauth_account()
+
   existing = read_meta(name)
+  verified, verify_error = verified_identity(blob)
+  json_oauth = current_oauth_account()
+
+  if verified:
+    # Keep ~/.claude.json's extra cosmetic fields (displayName, billingType and
+    # friends, which Claude Code shows) but only when it agrees about who this
+    # is; the verified values always win on the fields that decide anything.
+    agrees = json_oauth.get("accountUuid") == verified["accountUuid"]
+    oauth = {**json_oauth, **verified} if agrees else dict(verified)
+  else:
+    if existing and not force:
+      die(f"refusing to overwrite profile {name!r}: cannot verify which "
+          f"account the live credential belongs to ({verify_error}).\n"
+          f"  The check needs the API because the keychain blob carries no "
+          f"identity of its own. Saving blind could overwrite {name!r}'s "
+          f"stored credential with a different account's.\n"
+          f"  Retry when online, or re-run with --force to save anyway.")
+    # A brand-new profile has nothing to destroy, so fall back to the
+    # unverified identity rather than blocking the first save.
+    oauth = json_oauth
+    print(yellow(f"note: could not verify the live account ({verify_error}); "
+                 f"recording the identity from ~/.claude.json unverified"))
+
   if (not force and existing and existing.get("accountUuid")
       and oauth.get("accountUuid")
       and existing["accountUuid"] != oauth.get("accountUuid")):
     die(f"refusing to overwrite profile {name!r}: it holds "
         f"{existing.get('email') or existing['accountUuid']} but the live "
-        f"account is {account_label(oauth)}.\n"
+        f"credential belongs to {account_label(oauth)}.\n"
         f"  The live account may have been swapped back by another running "
         f"session. Check with: claude-account current\n"
         f"  If you really mean to repoint {name!r} at "
