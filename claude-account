@@ -1015,7 +1015,12 @@ def format_time_until(reset_epoch):
 
 
 def format_bar(utilization, width=20):
-  filled = int(utilization * width)
+  # Clamp rather than trust the input. Over 1.0 the padding count goes negative
+  # and contributes nothing, so the bar grows past `width` and every column
+  # after it on that line shifts - the one thing a fixed-width bar exists to
+  # prevent. Whether either backend can report over 100% is unconfirmed, which
+  # is the reason to clamp: it costs nothing and does not depend on the answer.
+  filled = max(0, min(width, int(utilization * width)))
   bar = "█" * filled + "░" * (width - filled)
   if utilization >= 0.9:
     return red(bar)
@@ -1027,7 +1032,11 @@ def format_bar(utilization, width=20):
 def quota_line(label, used, reset_epoch, extra=""):
   # Pad so every bucket line in every backend's block starts at one column.
   suffix = f"  {extra}" if extra else ""
-  print(f"    {label + ':':<14}{format_bar(used)} {(1.0 - used) * 100:5.1f}% remaining"
+  # Floor at zero for the same reason format_bar clamps: over 100% used, the
+  # unclamped form prints "-30.0% remaining", which reads as a measurement
+  # rather than the "nothing left" it actually means.
+  remaining = min(1.0, max(0.0, 1.0 - used)) * 100
+  print(f"    {label + ':':<14}{format_bar(used)} {remaining:5.1f}% remaining"
         f"  resets in {format_time_until(reset_epoch)}{suffix}")
 
 
