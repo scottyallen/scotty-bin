@@ -829,11 +829,12 @@ def browser_switch(name, outgoing):
               f"claude-account save {name} --browser-only"))
     return False
 
-  # Preserve the outgoing account's cookies before we overwrite them. There is
-  # no CDP form to be had here - nothing is running to read one from - so the
-  # outgoing profile keeps only its SQLite rows. That costs it the no-restart
-  # path until it is re-saved against a live browser, which is why this only
-  # happens when Chrome was already closed.
+  # Preserve the outgoing account's cookies before we overwrite them. No CDP
+  # form is obtainable here - nothing is running to read one from - so this
+  # refreshes only the SQLite half. The stored CDP form is left as it was
+  # rather than dropped, so a switch with Chrome closed costs the outgoing
+  # profile nothing; that is the merge in browser_snapshot(), and it is what
+  # keeps this path off the ratchet.
   #
   # The account behind those rows can't be read (they're encrypted), so this
   # snapshot is verified only as far as jar_matches_other_profile() can reach:
@@ -1304,8 +1305,14 @@ def cmd_save(args):
   name = names[0]
   if browser_only:
     # Re-capture only the claude.ai session, leaving the stored CLI token
-    # alone. This is the repair for a profile whose CDP form got stripped:
-    # the token is fine, it's the browser snapshot that needs refreshing.
+    # alone. Two uses, neither of them repairing a strip - browser_snapshot()
+    # only ever replaces a form with a capture that produced its own
+    # sessionKey, so a form can no longer be lost:
+    #   - seeding a CDP form on a profile whose saves have all happened with
+    #     Chrome closed, so it only ever got the SQLite half;
+    #   - refreshing a form the merge deliberately kept in a stale state (the
+    #     trade recorded on browser_snapshot's payload) once a browser that
+    #     can see it is available.
     meta = read_meta(name)
     if meta is None:
       avail = ", ".join(list_profile_names()) or "(none)"
