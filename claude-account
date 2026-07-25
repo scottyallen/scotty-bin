@@ -1,0 +1,1411 @@
+#!/usr/bin/env python3
+"""Switch between logged-in Claude Code accounts without re-authenticating.
+
+Claude Code keeps its OAuth credentials in the macOS login keychain under the
+generic-password service "Claude Code-credentials". Every running `claude`
+session reads that single entry, so overwriting it swaps the account for all
+sessions - they pick up the new token on their next refresh. That is the same
+propagation you see after a manual re-login, but with no login.
+
+This tool snapshots the live credential into named profiles (each stored as its
+own keychain entry, so the secret tokens never touch disk) and swaps a saved
+profile back in on demand. It also updates the human-readable identity in
+~/.claude.json (oauthAccount) so the UI shows the right account immediately;
+that field self-corrects from the API on the next profile fetch anyway, the
+token is the real source of truth.
+
+Alongside the CLI token, `save`/`switch` also snapshot and restore the claude.ai
+browser login (the sessionKey cookie et al) so the Chrome session and the
+Claude-in-Chrome extension follow the same account. Chrome caches cookies in
+memory and never re-reads the on-disk jar while running, so a running Chrome is
+swapped in place over the DevTools protocol and a stopped one by rewriting the
+jar. Chrome is never quit or restarted - if it is running and DevTools can't be
+reached, the browser swap fails and says so. Pass --no-browser to switch only
+the CLI token and leave the browser alone.
+
+Usage:
+  claude-account list                 List saved profiles, mark the current one
+  claude-account current              Show the currently logged-in account
+  claude-account save <name>          Snapshot the live account into <name>
+                                      (CLI token + claude.ai browser session;
+                                       --browser-only skips the CLI token)
+  claude-account switch <name>        Swap <name> in as the live account
+                                      (add --no-browser to skip the Chrome swap)
+  claude-account remove <name>        Delete a saved profile
+  claude-account quota [<name>...]    Show usage quota for every saved profile
+                                      (plus GLM/Z.ai and Kimi/Moonshot)
+  claude-account help                 This help
+
+`quota` reads each saved profile's token straight out of the keychain (the
+active account's live one, the rest refreshed from their snapshot), so there is
+no account list to maintain, and shows the GLM (Z.ai) plan and Kimi (Moonshot)
+prepaid credit alongside the Claude Max buckets.
+
+Typical one-time setup (each account only has to log in once, ever):
+  # while logged in as your first account:
+  claude-account save claude1
+  # /login as your second account in Claude, then:
+  claude-account save claude2
+  # from then on, no more logins:
+  claude-account switch claude1
+"""
+
+import base64
+import getpass
+import json
+import os
+import socket
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+LIVE_SERVICE = "Claude Code-credentials"
+PROFILE_SERVICE_PREFIX = "claude-account:"
+# The claude.ai browser cookies for a profile are stored in their own keychain
+# entry, separate from the CLI token above. They decrypt to the live session
+# token with the machine's Chrome Safe Storage key, so they are just as secret
+# as the CLI credential and belong in the keychain, not on disk.
+BROWSER_SERVICE_PREFIX = "claude-account-browser:"
+KEYCHAIN_ACCOUNT = getpass.getuser()  # Claude Code uses the OS username here.
+META_DIR = os.path.expanduser("~/.config/pa/claude-accounts")
+CLAUDE_JSON = os.path.expanduser("~/.claude.json")
+
+# The Chrome profile whose cookie jar holds the claude.ai login. claude.ai is
+# logged in per-browser-profile, independent of which Claude account it is, so
+# swapping accounts means rewriting cookies inside one Chrome profile (the
+# Default profile unless overridden). The env var lets a different profile dir
+# (e.g. "Profile 2") be targeted without editing this file.
+CHROME_APP = "Google Chrome"
+CHROME_PROFILE_DIR = os.environ.get("CLAUDE_ACCOUNT_CHROME_PROFILE", "Default")
+CHROME_USER_DATA = os.path.expanduser(
+    "~/Library/Application Support/Google/Chrome")
+# The claude.ai cookies that together establish which account (and org) the
+# browser and the Claude-in-Chrome extension act as. sessionKey is the auth
+# token; the others keep the org/routing consistent so a swap doesn't leave a
+# half-account state. We snapshot/restore this set as one coherent unit.
+BROWSER_COOKIE_NAMES = ("sessionKey", "sessionKeyLC", "lastActiveOrg",
+                        "routingHint")
+COOKIE_HOST = ".claude.ai"
+
+API_URL = "https://api.anthropic.com/v1/messages"
+# The OAuth client id Claude Code itself uses; refreshing a saved profile's
+# token is the same exchange the CLI does for the live credential. It has to go
+# to api.anthropic.com - console.anthropic.com/v1/oauth/token sits behind a
+# Cloudflare rule that answers "error code: 1010" for non-browser clients.
+OAUTH_TOKEN_URL = "https://api.anthropic.com/v1/oauth/token"
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+# Probing with Fable is what makes the API return the extra 7d_oi bucket (the
+# separate weekly quota for premium models). Haiku only yields 5h/7d.
+PROBE_MODEL = "claude-fable-5"
+FALLBACK_MODEL = "claude-haiku-4-5-20251001"
+
+# GLM via Z.ai is a separate backend (see ~/bin/glm). Z.ai speaks the Anthropic
+# wire protocol for model calls but returns no rate-limit headers there, so
+# coding-plan usage is read from its monitor API instead.
+SECRETS_ENV = os.path.expanduser("~/.config/pa/secrets.env")
+ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
+
+# Kimi (see ~/bin/kimi) is prepaid pay-as-you-go, so what matters is the
+# remaining credit rather than a quota window.
+MOONSHOT_BALANCE_URL = "https://api.moonshot.ai/v1/users/me/balance"
+LOW_CREDIT_USD = 5.0
+
+
+# --- terminal color helpers -------------------------------------------------
+
+def c(text, code):
+  if not sys.stdout.isatty():
+    return text
+  return f"\033[{code}m{text}\033[0m"
+
+
+def bold(t):
+  return c(t, "1")
+
+
+def green(t):
+  return c(t, "32")
+
+
+def yellow(t):
+  return c(t, "33")
+
+
+def red(t):
+  return c(t, "31")
+
+
+def dim(t):
+  return c(t, "2")
+
+
+def die(msg):
+  print(red(f"error: {msg}"), file=sys.stderr)
+  sys.exit(1)
+
+
+# --- keychain access --------------------------------------------------------
+
+def keychain_read(service):
+  """Return the stored password blob for `service`, or None if absent."""
+  result = subprocess.run(
+      ["security", "find-generic-password", "-s", service,
+       "-a", KEYCHAIN_ACCOUNT, "-w"],
+      capture_output=True, text=True,
+  )
+  if result.returncode != 0:
+    return None
+  return result.stdout.rstrip("\n")
+
+
+def keychain_write(service, blob):
+  """Create or update the `service` keychain entry with `blob`."""
+  # -U updates in place if the (service, account) entry already exists.
+  # `security` has no way to read the secret from stdin/file, so it goes on the
+  # argv. That is a sub-second exposure to `ps` on this single-user Mac only.
+  result = subprocess.run(
+      ["security", "add-generic-password", "-U",
+       "-a", KEYCHAIN_ACCOUNT, "-s", service, "-w", blob],
+      capture_output=True, text=True,
+  )
+  if result.returncode != 0:
+    die(f"failed to write keychain entry {service!r}: {result.stderr.strip()}")
+
+
+def keychain_delete(service):
+  subprocess.run(
+      ["security", "delete-generic-password", "-s", service,
+       "-a", KEYCHAIN_ACCOUNT],
+      capture_output=True, text=True,
+  )
+
+
+def profile_service(name):
+  return PROFILE_SERVICE_PREFIX + name
+
+
+def refresh_profile_token(name):
+  """Exchange profile `name`'s refresh token for a fresh access token.
+
+  A snapshot's access token dies about 8 hours after it was saved, which makes
+  every non-active profile unprobeable. Claude Code itself refreshes only the
+  live credential, so a profile you haven't switched to in a day is always
+  stale. We do the same OAuth refresh the CLI does and write the result back
+  into the profile, so the snapshot stays usable (and `switch` hands over a
+  working token instead of one the API has already forgotten).
+
+  Refresh tokens rotate on use, so the new blob MUST be persisted or the
+  profile is bricked - the write is therefore the last thing that can fail.
+  Returns (access_token, error).
+  """
+  blob = keychain_read(profile_service(name))
+  if not blob:
+    return None, "no stored credential"
+  try:
+    data = json.loads(blob)
+  except ValueError:
+    return None, "stored credential is not valid JSON"
+  oauth = data.get("claudeAiOauth") or data
+  refresh = oauth.get("refreshToken")
+  if not refresh:
+    return None, "stored credential has no refresh token"
+
+  # A snapshot taken from the account that is still live shares its refresh
+  # token with the live entry. Rotating it here would invalidate the token every
+  # running `claude` session is holding and log them out, so borrow the live
+  # access token instead - same account, and Claude Code keeps it fresh.
+  if refresh == refresh_token_of(keychain_read(LIVE_SERVICE)):
+    live_token = access_token(keychain_read(LIVE_SERVICE))
+    if live_token:
+      return live_token, ""
+
+  payload = json.dumps({
+      "grant_type": "refresh_token",
+      "refresh_token": refresh,
+      "client_id": OAUTH_CLIENT_ID,
+  }).encode()
+  req = urllib.request.Request(
+      OAUTH_TOKEN_URL,
+      data=payload,
+      headers={"Content-Type": "application/json",
+               "Accept": "application/json",
+               # Without a claude-cli UA the endpoint 404s.
+               "User-Agent": "claude-cli/2.0.0 (external, cli)"},
+      method="POST",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+      body = json.loads(resp.read())
+  except urllib.error.HTTPError as e:
+    try:
+      detail = json.loads(e.read())
+      msg = detail.get("error_description") or detail.get("error") or ""
+    except (ValueError, OSError, AttributeError):
+      msg = ""
+    return None, f"refresh failed (HTTP {e.code}{': ' + msg if msg else ''})"
+  except urllib.error.URLError as e:
+    return None, f"refresh failed: {e.reason}"
+  except ValueError:
+    return None, "refresh returned an unparseable response"
+
+  token = body.get("access_token")
+  if not token:
+    return None, "refresh response had no access_token"
+  oauth["accessToken"] = token
+  if body.get("refresh_token"):
+    oauth["refreshToken"] = body["refresh_token"]
+  if body.get("expires_in"):
+    oauth["expiresAt"] = int((time.time() + float(body["expires_in"])) * 1000)
+  keychain_write(profile_service(name), json.dumps(data))
+  return token, ""
+
+
+def refresh_token_of(blob):
+  """The refresh token inside a credential blob, or None."""
+  if not blob:
+    return None
+  try:
+    data = json.loads(blob)
+  except ValueError:
+    return None
+  oauth = data.get("claudeAiOauth") or data
+  token = oauth.get("refreshToken")
+  return token if isinstance(token, str) and token else None
+
+
+def token_expired(blob):
+  """True if the blob's access token is past its expiry (or has none)."""
+  try:
+    data = json.loads(blob)
+  except (ValueError, TypeError):
+    return True
+  oauth = data.get("claudeAiOauth") or data
+  expires_at = oauth.get("expiresAt")
+  if not expires_at:
+    return False  # No expiry recorded - let the probe decide.
+  return float(expires_at) / 1000.0 <= time.time()
+
+
+def access_token(blob):
+  """Pull the OAuth access token out of a stored credential blob.
+
+  The blob is Claude Code's own keychain JSON: {"claudeAiOauth": {...}}. Older
+  or hand-made entries have sometimes been flat, so accept that shape too.
+  """
+  if not blob:
+    return None
+  try:
+    data = json.loads(blob)
+  except ValueError:
+    return None
+  oauth = data.get("claudeAiOauth") or data
+  token = oauth.get("accessToken")
+  return token if isinstance(token, str) and token else None
+
+
+# --- CDP: talk to a LIVE Chrome so a switch needs no restart -----------------
+#
+# Chrome caches cookies in memory and never re-reads the on-disk jar, so the
+# SQLite path below can only be applied to a stopped Chrome. The DevTools
+# protocol can set cookies (HttpOnly included) on a running browser instead.
+# Chrome 136+ hardens off the /json HTTP endpoints on the default user-data-dir,
+# but the browser-level WebSocket still works and Chrome publishes its URL in
+# DevToolsActivePort - which is all we need. If remote debugging isn't enabled
+# at all, cdp_connect() fails, and with a running Chrome that is the end of the
+# road: the browser swap reports failure rather than closing the browser to get
+# at the jar.
+
+DEVTOOLS_PORT_FILE = os.path.join(CHROME_USER_DATA, "DevToolsActivePort")
+
+
+class _WS:
+  """Just enough RFC6455 to exchange JSON with Chrome (no third-party deps)."""
+
+  def __init__(self, host, port, path):
+    self.sock = socket.create_connection((host, port), timeout=10)
+    key = base64.b64encode(os.urandom(16)).decode()
+    # Deliberately no Origin header - Chrome rejects cross-origin DevTools
+    # WebSockets unless --remote-allow-origins was passed, but accepts a
+    # request that carries no Origin at all.
+    req = (f"GET {path} HTTP/1.1\r\nHost: localhost:{port}\r\n"
+           f"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+           f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
+    self.sock.sendall(req.encode())
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+      chunk = self.sock.recv(4096)
+      if not chunk:
+        raise OSError("connection closed during DevTools handshake")
+      buf += chunk
+    if "101" not in buf.split(b"\r\n", 1)[0].decode():
+      raise OSError("DevTools WebSocket handshake refused")
+    self._rest = buf.split(b"\r\n\r\n", 1)[1]
+    self._id = 0
+
+  def _recv_exact(self, n):
+    out, self._rest = self._rest[:n], self._rest[n:]
+    while len(out) < n:
+      chunk = self.sock.recv(n - len(out))
+      if not chunk:
+        raise OSError("DevTools connection closed")
+      out += chunk
+    return out
+
+  def _send(self, obj):
+    payload = json.dumps(obj).encode()
+    header = bytearray([0x81])  # FIN + text frame
+    n = len(payload)
+    if n < 126:
+      header.append(0x80 | n)
+    elif n < 65536:
+      header.append(0x80 | 126)
+      header += struct.pack(">H", n)
+    else:
+      header.append(0x80 | 127)
+      header += struct.pack(">Q", n)
+    mask = os.urandom(4)
+    header += mask
+    self.sock.sendall(bytes(header)
+                      + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+  def call(self, method, params=None):
+    """Send one command and pump messages until its reply comes back."""
+    self._id += 1
+    mid = self._id
+    self._send({"id": mid, "method": method, "params": params or {}})
+    while True:
+      b0, b1 = self._recv_exact(2)
+      n = b1 & 0x7F
+      if n == 126:
+        n = struct.unpack(">H", self._recv_exact(2))[0]
+      elif n == 127:
+        n = struct.unpack(">Q", self._recv_exact(8))[0]
+      msg = json.loads(self._recv_exact(n))
+      if msg.get("id") == mid:
+        return msg
+
+  def close(self):
+    try:
+      self.sock.close()
+    except OSError:
+      pass
+
+
+def cdp_connect():
+  """Connect to the running Chrome's browser target, or None if unavailable."""
+  try:
+    with open(DEVTOOLS_PORT_FILE) as f:
+      port = int(f.readline().strip())
+      path = f.readline().strip()
+    if not path:
+      return None
+    return _WS("127.0.0.1", port, path)
+  except (OSError, ValueError):
+    return None
+
+
+def cdp_get_identity_cookies(ws):
+  """The claude.ai identity cookies as CDP cookie dicts, from live memory.
+
+  Reading through Chrome rather than the jar also sidesteps the flush delay:
+  a cookie set seconds ago (a fresh login) is in memory but not yet on disk.
+  """
+  result = ws.call("Storage.getCookies").get("result", {})
+  out = []
+  for ck in result.get("cookies", []):
+    if ck.get("domain", "").endswith("claude.ai") \
+        and ck.get("name") in BROWSER_COOKIE_NAMES:
+      keep = {k: ck[k] for k in
+              ("name", "value", "domain", "path", "secure", "httpOnly")
+              if k in ck}
+      if ck.get("sameSite"):
+        keep["sameSite"] = ck["sameSite"]
+      # -1 marks a session cookie; passing it back through would be rejected.
+      if ck.get("expires", -1) and ck.get("expires", -1) > 0:
+        keep["expires"] = ck["expires"]
+      out.append(keep)
+  return out
+
+
+def cdp_set_cookies(ws, cookies):
+  """Install cookies into the live browser. Returns True on success."""
+  reply = ws.call("Storage.setCookies", {"cookies": cookies})
+  return "error" not in reply
+
+
+# --- browser session (claude.ai cookies) ------------------------------------
+
+def browser_service(name):
+  return BROWSER_SERVICE_PREFIX + name
+
+
+def cookie_db_path():
+  """Path to the Cookies SQLite jar for the targeted Chrome profile."""
+  return os.path.join(CHROME_USER_DATA, CHROME_PROFILE_DIR, "Cookies")
+
+
+def chrome_is_running():
+  return subprocess.run(["pgrep", "-x", CHROME_APP],
+                        capture_output=True).returncode == 0
+
+
+# There is deliberately no quit_chrome()/launch_chrome() here. An earlier
+# version quit a running Chrome so it could rewrite the on-disk cookie jar, then
+# relaunched it - which closed every open tab and killed any in-flight
+# claude-in-chrome session for the sake of a cookie swap. Restoring that
+# behaviour is not a fix for a failing switch; re-saving the profile against a
+# live browser is (see browser_switch).
+
+
+def _cookie_columns(con):
+  return [r[1] for r in con.execute("PRAGMA table_info(cookies)")]
+
+
+def read_browser_cookies():
+  """Read the claude.ai identity cookies out of the live jar.
+
+  Returns a list of full rows (every column, encrypted_value base64'd so the
+  snapshot is JSON/keychain-storable), or None if the jar is missing/unreadable.
+  Copies the DB to a temp file before opening it so a running Chrome's lock
+  doesn't block the read - this is only used at `save` time, when Chrome may
+  still be up.
+  """
+  src = cookie_db_path()
+  if not os.path.isfile(src):
+    return None
+  fd, tmp = tempfile.mkstemp(prefix="cc-cookies.")
+  os.close(fd)
+  try:
+    # -wal/-shm may hold unflushed rows; copying just the main file is fine for
+    # our cookies, which are persistent and long-since flushed.
+    subprocess.run(["cp", src, tmp], capture_output=True)
+    con = sqlite3.connect(tmp)
+    try:
+      cols = _cookie_columns(con)
+      ev = cols.index("encrypted_value")
+      q = (f"SELECT {','.join(cols)} FROM cookies "
+           f"WHERE host_key=? AND name IN "
+           f"({','.join('?' * len(BROWSER_COOKIE_NAMES))})")
+      rows = []
+      for r in con.execute(q, (COOKIE_HOST, *BROWSER_COOKIE_NAMES)):
+        d = dict(zip(cols, r))
+        d["encrypted_value"] = base64.b64encode(bytes(r[ev])).decode()
+        rows.append(d)
+      return rows
+    finally:
+      con.close()
+  except sqlite3.Error:
+    return None
+  finally:
+    try:
+      os.unlink(tmp)
+    except OSError:
+      pass
+
+
+def write_browser_cookies(rows):
+  """Upsert saved cookie rows back into the live jar. Chrome MUST be quit."""
+  db = cookie_db_path()
+  con = sqlite3.connect(db)
+  try:
+    live_cols = set(_cookie_columns(con))
+    for d in rows:
+      d = dict(d)
+      d["encrypted_value"] = base64.b64decode(d["encrypted_value"])
+      # Only set columns the current schema still has, so a Chrome that added a
+      # column since the snapshot doesn't break the insert.
+      use = [c for c in d if c in live_cols]
+      placeholders = ",".join("?" * len(use))
+      con.execute(
+          f"INSERT OR REPLACE INTO cookies ({','.join(use)}) "
+          f"VALUES ({placeholders})", [d[c] for c in use])
+    con.commit()
+  finally:
+    con.close()
+
+
+def browser_snapshot(name, quiet=False, expected_org=None, cdp_cookies=None):
+  """Capture the live claude.ai browser session into profile `name`.
+
+  Captures both representations when it can: the CDP form (plaintext cookies,
+  read from Chrome's memory) drives the no-restart switch, and the SQLite form
+  (raw encrypted rows) is the fallback for when DevTools isn't reachable. Either
+  alone is enough to restore.
+
+  `cdp_cookies` lets a caller hand in a CDP form it read earlier. browser_switch
+  needs this: it can only snapshot the outgoing account after quitting Chrome,
+  and cdp_connect() cannot reach a dead browser.
+
+  Best-effort: if Chrome isn't set up or isn't logged into claude.ai, we warn and
+  move on rather than failing the whole save - the CLI token is the primary
+  artifact.
+  """
+  payload = {"savedAt": int(time.time()), "profileDir": CHROME_PROFILE_DIR}
+
+  if cdp_cookies is not None:
+    payload["cdp"] = cdp_cookies
+  else:
+    ws = cdp_connect()
+    if ws:
+      try:
+        payload["cdp"] = cdp_get_identity_cookies(ws)
+      except OSError:
+        pass
+      finally:
+        ws.close()
+
+  # When DevTools gave us plaintext we can tell which account the browser is
+  # actually logged into. Refuse to overwrite a saved session with a different
+  # account's - the same class of mistake the CLI guard in snapshot() blocks.
+  if expected_org and payload.get("cdp"):
+    live_org = next((c["value"] for c in payload["cdp"]
+                     if c["name"] == "lastActiveOrg"), None)
+    if live_org and live_org != expected_org:
+      if not quiet:
+        print(yellow(f"note: the browser is logged into org {live_org}, not "
+                     f"{name}'s org {expected_org}; browser session NOT saved "
+                     f"(log claude.ai into the right account first)"))
+      return False
+
+  rows = read_browser_cookies()
+  if rows:
+    payload["sqlite"] = rows
+
+  names = {c["name"] for c in payload.get("cdp", [])} \
+      | {r["name"] for r in payload.get("sqlite", [])}
+  if "sessionKey" not in names:
+    if not quiet:
+      hint = ("" if payload.get("cdp") else
+              " (Chrome not running / DevTools unreachable, and the on-disk jar"
+              " had none either)")
+      print(yellow(f"note: Chrome profile {CHROME_PROFILE_DIR!r} has no "
+                   f"claude.ai sessionKey; browser session not saved{hint}"))
+    return False
+
+  keychain_write(browser_service(name), json.dumps(payload))
+  if not quiet:
+    how = "live browser" if payload.get("cdp") else "on-disk jar"
+    print(green("saved") + f" browser session for {bold(name)} "
+          f"({len(names)} cookies via {how})")
+  return True
+
+
+def read_browser_snapshot(name):
+  """Return the saved snapshot dict for `name`, or None if absent/corrupt.
+
+  Normalizes the pre-CDP format, which stored the SQLite rows under "cookies".
+  """
+  blob = keychain_read(browser_service(name))
+  if not blob:
+    return None
+  try:
+    snap = json.loads(blob)
+  except ValueError:
+    return None
+  if "cookies" in snap and "sqlite" not in snap:
+    snap["sqlite"] = snap["cookies"]
+  return snap
+
+
+def outgoing_org(outgoing):
+  """The organizationUuid profile `outgoing` is supposed to be logged into."""
+  return ((read_meta(outgoing) or {}).get("oauthAccount") or {}).get(
+      "organizationUuid")
+
+
+def browser_switch(name, outgoing):
+  """Swap the browser to profile `name`'s claude.ai session.
+
+  Two paths, and neither one ever closes a window you have open:
+
+    Chrome running     - swap the cookies in place over DevTools.
+    Chrome not running - rewrite the on-disk jar, which is only safe (and only
+                         possible) with nothing holding the SQLite lock.
+
+  This tool used to bridge the gap by quitting a running Chrome, rewriting the
+  jar, and relaunching. It no longer does, at all: killing the browser takes
+  every open tab and any in-flight claude-in-chrome session with it, which is a
+  worse outcome than a switch that declines to happen. So a running Chrome that
+  DevTools can't reach is now a hard failure with instructions, not a restart.
+
+  Returns True on a completed swap.
+  """
+  snap = read_browser_snapshot(name)
+  if not snap:
+    print(yellow(f"note: no saved browser session for {name!r} - the browser "
+                 f"was left as-is. Save one with: claude-account save {name}"))
+    return False
+
+  # --- Chrome running: swap in place over DevTools, no restart ---
+  if chrome_is_running():
+    if not snap.get("cdp"):
+      print(red(f"error: profile {name!r} has no live-swappable cookie "
+                f"snapshot, and the only other way to install one is a write "
+                f"to the on-disk jar that a running Chrome would ignore. "
+                f"Browser session unchanged."))
+      print(dim(f"  fix: quit Chrome and re-run, or - once claude.ai is "
+                f"logged into {name} - run: "
+                f"claude-account save {name} --browser-only"))
+      return False
+
+    ws = cdp_connect()
+    if not ws:
+      print(red("error: Chrome is running but its DevTools endpoint is "
+                "unreachable, so the session can't be swapped in place. "
+                "Browser session unchanged."))
+      print(dim("  fix: retry (this endpoint is intermittent), or quit Chrome "
+                "and re-run to take the on-disk path."))
+      return False
+
+    try:
+      # Preserve the outgoing account's freshest cookies first - reading from
+      # memory means we catch a session that rotated since the last save.
+      if outgoing and outgoing != name:
+        out_cdp = cdp_get_identity_cookies(ws)
+        # Same wrong-account guard as `save`: the browser may be logged into
+        # someone other than the outgoing CLI account (a previous
+        # `switch --no-browser` does exactly that), and saving those cookies
+        # would overwrite the outgoing profile with a stranger's session.
+        exp_org = outgoing_org(outgoing)
+        live_org = next((c["value"] for c in out_cdp
+                         if c["name"] == "lastActiveOrg"), None)
+        if exp_org and live_org and live_org != exp_org:
+          print(yellow(f"note: the browser is logged into org {live_org}, not "
+                       f"{outgoing}'s org {exp_org}; {outgoing}'s saved "
+                       f"session left untouched"))
+        else:
+          out_snap = read_browser_snapshot(outgoing) or {}
+          out_snap.update({"savedAt": int(time.time()),
+                           "profileDir": CHROME_PROFILE_DIR,
+                           "cdp": out_cdp})
+          out_snap.pop("cookies", None)
+          keychain_write(browser_service(outgoing), json.dumps(out_snap))
+          print(dim(f"(snapshotted outgoing browser session -> {outgoing})"))
+
+      if cdp_set_cookies(ws, snap["cdp"]):
+        print(green("switched") + f" browser session to {bold(name)}"
+              + dim(" (live, no restart)"))
+        return True
+      print(red("error: DevTools refused the cookie write; browser session "
+                "unchanged."))
+      return False
+    except OSError as e:
+      print(red(f"error: DevTools connection failed ({e}); browser session "
+                f"unchanged."))
+      return False
+    finally:
+      ws.close()
+
+  # --- Chrome not running: rewrite the on-disk jar directly ---
+  if not snap.get("sqlite"):
+    print(red(f"error: profile {name!r} has no on-disk cookie snapshot, and "
+              f"the live path needs a running Chrome. Browser session "
+              f"unchanged."))
+    print(dim(f"  fix: start Chrome, log claude.ai into {name}, then: "
+              f"claude-account save {name} --browser-only"))
+    return False
+
+  # Preserve the outgoing account's cookies before we overwrite them. There is
+  # no CDP form to be had here - nothing is running to read one from - so the
+  # outgoing profile keeps only its SQLite rows. That costs it the no-restart
+  # path until it is re-saved against a live browser, which is why this only
+  # happens when Chrome was already closed.
+  if outgoing and outgoing != name:
+    if browser_snapshot(outgoing, quiet=True,
+                        expected_org=outgoing_org(outgoing)):
+      print(dim(f"(snapshotted outgoing browser session -> {outgoing})"))
+    else:
+      print(yellow(f"note: outgoing browser session not snapshotted; "
+                   f"{outgoing}'s saved session is unchanged"))
+
+  try:
+    write_browser_cookies(snap["sqlite"])
+  except sqlite3.Error as e:
+    print(red(f"error: failed to write Chrome cookie jar: {e}"))
+    return False
+
+  print(green("switched") + f" browser session to {bold(name)}"
+        + dim(" (Chrome was not running)"))
+  return True
+
+
+# --- ~/.claude.json identity ------------------------------------------------
+
+def read_claude_json():
+  try:
+    with open(CLAUDE_JSON) as f:
+      return json.load(f)
+  except (OSError, ValueError):
+    return {}
+
+
+def current_oauth_account():
+  """The oauthAccount object from ~/.claude.json (identity, not secret)."""
+  return read_claude_json().get("oauthAccount") or {}
+
+
+def write_oauth_account(oauth_account):
+  """Atomically replace only the oauthAccount key in ~/.claude.json.
+
+  Claude Code writes this file often; we read the freshest copy, swap one key,
+  and rename a temp file over it so we never leave a half-written file. A
+  concurrent Claude write could still be lost, but the fields there are cosmetic
+  and self-heal on the next profile fetch.
+  """
+  data = read_claude_json()
+  if not data:
+    # Don't create a bogus ~/.claude.json from nothing.
+    return False
+  data["oauthAccount"] = oauth_account
+  d = os.path.dirname(CLAUDE_JSON)
+  fd, tmp = tempfile.mkstemp(dir=d, prefix=".claude.json.")
+  try:
+    with os.fdopen(fd, "w") as f:
+      json.dump(data, f, indent=2)
+    os.replace(tmp, CLAUDE_JSON)
+  except OSError as e:
+    try:
+      os.unlink(tmp)
+    except OSError:
+      pass
+    die(f"failed to update {CLAUDE_JSON}: {e}")
+  return True
+
+
+# --- profile metadata (non-secret) ------------------------------------------
+
+def meta_path(name):
+  return os.path.join(META_DIR, name + ".json")
+
+
+def read_meta(name):
+  try:
+    with open(meta_path(name)) as f:
+      return json.load(f)
+  except (OSError, ValueError):
+    return None
+
+
+def write_meta(name, meta):
+  os.makedirs(META_DIR, exist_ok=True)
+  path = meta_path(name)
+  fd, tmp = tempfile.mkstemp(dir=META_DIR, prefix="." + name + ".")
+  with os.fdopen(fd, "w") as f:
+    json.dump(meta, f, indent=2)
+  os.replace(tmp, path)
+  os.chmod(path, 0o600)
+
+
+def list_profile_names():
+  if not os.path.isdir(META_DIR):
+    return []
+  names = []
+  for fn in os.listdir(META_DIR):
+    if fn.endswith(".json") and not fn.startswith("."):
+      names.append(fn[:-len(".json")])
+  return sorted(names)
+
+
+def account_label(oauth_account):
+  """Short human label for an oauthAccount identity."""
+  email = oauth_account.get("emailAddress") or "unknown"
+  return email
+
+
+def find_profile_for_uuid(account_uuid):
+  """Return the profile name whose saved identity matches account_uuid."""
+  if not account_uuid:
+    return None
+  for name in list_profile_names():
+    meta = read_meta(name)
+    if meta and meta.get("accountUuid") == account_uuid:
+      return name
+  return None
+
+
+# --- quota: Anthropic ---------------------------------------------------------
+
+def probe_quota(token, model=PROBE_MODEL):
+  """Make a minimal API call to get rate limit headers.
+
+  Returns (headers, error). Exactly one is meaningful.
+  """
+  data = json.dumps({
+      "model": model,
+      "max_tokens": 1,
+      # Premium models reject an OAuth token that doesn't look like the CLI,
+      # and that rejection carries no rate limit headers at all.
+      "system": [{
+          "type": "text",
+          "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+      }],
+      "messages": [{"role": "user", "content": "x"}],
+  }).encode()
+  req = urllib.request.Request(
+      API_URL,
+      data=data,
+      headers={
+          "Authorization": f"Bearer {token}",
+          "anthropic-version": "2023-06-01",
+          "anthropic-beta": "oauth-2025-04-20,claude-code-20250219",
+          "user-agent": "claude-cli/2.0.0 (external, cli)",
+          "x-app": "cli",
+          "Content-Type": "application/json",
+      },
+      method="POST",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+      return {k.lower(): v for k, v in resp.headers.items()}, ""
+  except urllib.error.HTTPError as e:
+    headers = {k.lower(): v for k, v in e.headers.items()}
+    # 429 still returns rate limit headers.
+    if any("ratelimit" in k for k in headers):
+      return headers, ""
+    try:
+      message = json.loads(e.read()).get("error", {}).get("message", "")
+    except (ValueError, OSError):
+      message = ""
+    return None, f"HTTP {e.code}: {message or e.reason}"
+  except urllib.error.URLError as e:
+    return None, f"connection failed: {e.reason}"
+
+
+def format_time_until(reset_epoch):
+  delta = reset_epoch - time.time()
+  if delta <= 0:
+    return "now"
+  hours = int(delta // 3600)
+  minutes = int((delta % 3600) // 60)
+  if hours > 24:
+    days = hours // 24
+    hours = hours % 24
+    return f"{days}d {hours}h"
+  if hours > 0:
+    return f"{hours}h {minutes}m"
+  return f"{minutes}m"
+
+
+def format_bar(utilization, width=20):
+  filled = int(utilization * width)
+  bar = "█" * filled + "░" * (width - filled)
+  if utilization >= 0.9:
+    return red(bar)
+  if utilization >= 0.7:
+    return yellow(bar)
+  return green(bar)
+
+
+def quota_line(label, used, reset_epoch, extra=""):
+  # Pad so every bucket line in every backend's block starts at one column.
+  suffix = f"  {extra}" if extra else ""
+  print(f"    {label + ':':<14}{format_bar(used)} {(1.0 - used) * 100:5.1f}% remaining"
+        f"  resets in {format_time_until(reset_epoch)}{suffix}")
+
+
+def render_account_quota(name, token, is_current):
+  """Probe one Claude account and print its 5h / 7d / Fable buckets."""
+  marker = green(" *") if is_current else ""
+  headers, error = probe_quota(token)
+  # A Fable probe can fail on its own (exhausted premium quota, model
+  # unavailable) while the account is otherwise fine. Fall back to Haiku so the
+  # 5h/7d numbers still show up.
+  if not headers:
+    headers, error = probe_quota(token, FALLBACK_MODEL)
+  if not headers:
+    print(f"  {bold(name)}{marker}: {red(error)}")
+    if "401" in error or "authentication" in error.lower():
+      print(dim(f"    stored token may be stale - refresh it with: "
+                f"claude-account save {name}"))
+    print()
+    return
+
+  def bucket(prefix):
+    util = headers.get(f"anthropic-ratelimit-unified-{prefix}-utilization")
+    if util is None:
+      return None
+    return (float(util),
+            float(headers.get(f"anthropic-ratelimit-unified-{prefix}-reset", 0)),
+            headers.get(f"anthropic-ratelimit-unified-{prefix}-status", "?"))
+
+  session = bucket("5h")
+  weekly = bucket("7d")
+  fable = bucket("7d_oi")
+
+  statuses = [b[2] for b in (session, weekly, fable) if b]
+  status_icon = ""
+  if "rejected" in statuses:
+    status_icon = " " + red("(RATE LIMITED)")
+  elif "allowed_warning" in statuses:
+    status_icon = " " + yellow("(warning)")
+
+  print(f"  {bold(name)}{marker}{status_icon}")
+  for label, b in (("Session (5h)", session), ("Weekly  (7d)", weekly)):
+    if b:
+      quota_line(label, b[0], b[1])
+  if fable:
+    quota_line("Fable   (7d)", fable[0], fable[1])
+  else:
+    print(f"    {'Fable   (7d):':<14}{dim('(unavailable)')}")
+  print()
+
+
+# --- quota: GLM (Z.ai) --------------------------------------------------------
+
+def load_secret(key):
+  """Read `key` from the same secrets.env the `glm` and `kimi` launchers source.
+
+  Returns None if the file or key is absent so the rest of the output still
+  renders.
+  """
+  if not os.path.isfile(SECRETS_ENV):
+    return None
+  try:
+    with open(SECRETS_ENV) as f:
+      for raw in f:
+        line = raw.strip()
+        if line.startswith("export "):
+          line = line[len("export "):].strip()
+        if line.startswith(key + "="):
+          val = line[len(key) + 1:].strip()
+          if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+          return val
+  except OSError:
+    return None
+  return None
+
+
+def http_get_json(url, api_key):
+  """GET a JSON endpoint with a bearer token. Returns (payload, error)."""
+  req = urllib.request.Request(
+      url,
+      headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+      method="GET",
+  )
+  try:
+    with urllib.request.urlopen(req, timeout=15) as resp:
+      return json.loads(resp.read()), ""
+  except urllib.error.HTTPError as e:
+    try:
+      body = json.loads(e.read())
+      msg = body.get("msg") or body.get("error", {}).get("message", "")
+    except (ValueError, OSError, AttributeError):
+      msg = ""
+    return None, msg or f"HTTP {e.code}"
+  except urllib.error.URLError as e:
+    return None, f"connection failed: {e.reason}"
+  except ValueError:
+    return None, "unparseable response"
+
+
+def _glm_window_label(reset_epoch_s):
+  """Bucket a quota window's reset time into a 5h/7d/30d label."""
+  delta = reset_epoch_s - time.time()
+  if delta < 0:
+    return "?"
+  if delta < 1.5 * 86400:
+    return "5h"
+  if delta < 10 * 86400:
+    return "7d"
+  if delta < 45 * 86400:
+    return "30d"
+  return "long"
+
+
+# 12-char labels so the GLM block lines up with the Claude Max Session/Weekly
+# lines. Value is (label, display order).
+_GLM_LABEL_BY_WINDOW = {
+    "5h": ("Session (5h)", 0),
+    "7d": ("Weekly  (7d)", 1),
+    "30d": ("Tools  (30d)", 2),
+}
+
+
+def render_glm():
+  """Print the Z.ai (GLM) Coding Plan quota block."""
+  api_key = load_secret("ZAI_API_KEY")
+  if not api_key:
+    print(f"  {bold('glm')}: {dim('(ZAI_API_KEY not set in ' + SECRETS_ENV + ')')}")
+    print()
+    return
+
+  payload, error = http_get_json(ZAI_QUOTA_URL, api_key)
+  if payload and not payload.get("success"):
+    payload, error = None, payload.get("msg", "request failed")
+  if not payload:
+    print(f"  {bold('glm')}: {red(error)}")
+    print()
+    return
+  data = payload.get("data") or {}
+
+  rows = []  # (sort_key, label, used_fraction, reset_s, extra_or_None)
+  max_used = 0.0
+  for lim in data.get("limits", []):
+    pct_used = float(lim.get("percentage", 0))
+    reset_s = float(lim.get("nextResetTime", 0)) / 1000.0
+    window = _glm_window_label(reset_s)
+    label, sort_key = _GLM_LABEL_BY_WINDOW.get(window, (None, 99))
+    if label is None:
+      label = f"Tokens ({window})"
+    extra = None
+    if lim.get("type") == "TIME_LIMIT":
+      # On the tools limit `usage` is the cap and `currentValue` is consumed.
+      cap = float(lim.get("usage", 0))
+      used_n = float(lim.get("currentValue", 0))
+      extra = f"{int(used_n)}/{int(cap)} used"
+    rows.append((sort_key, label, pct_used / 100.0, reset_s, extra))
+    max_used = max(max_used, pct_used / 100.0)
+
+  status_icon = ""
+  if max_used >= 1.0:
+    status_icon = " " + red("(RATE LIMITED)")
+  elif max_used >= 0.9:
+    status_icon = " " + yellow("(warning)")
+
+  print(f"  {bold('glm')} {dim('(z.ai · ' + str(data.get('level', '?')) + ' plan)')}"
+        f"{status_icon}")
+  for _, label, used, reset_s, extra in sorted(rows, key=lambda r: r[0]):
+    quota_line(label, used, reset_s, extra or "")
+  print()
+
+
+# --- quota: Kimi (Moonshot) ---------------------------------------------------
+
+def render_kimi():
+  """Print the Moonshot (Kimi) prepaid credit balance.
+
+  Moonshot is pay-as-you-go rather than a rate-limited plan, so there is no
+  utilization window to draw - the meaningful number is dollars left.
+  """
+  api_key = load_secret("MOONSHOT_API_KEY")
+  if not api_key:
+    print(f"  {bold('kimi')}: "
+          f"{dim('(MOONSHOT_API_KEY not set in ' + SECRETS_ENV + ')')}")
+    print()
+    return
+
+  payload, error = http_get_json(MOONSHOT_BALANCE_URL, api_key)
+  if payload and payload.get("code") not in (0, None):
+    payload, error = None, payload.get("scode") or f"code {payload.get('code')}"
+  if not payload:
+    print(f"  {bold('kimi')}: {red(error)}")
+    print()
+    return
+
+  data = payload.get("data") or {}
+  available = float(data.get("available_balance", 0))
+  cash = float(data.get("cash_balance", 0))
+  voucher = float(data.get("voucher_balance", 0))
+
+  # Balances are USD on the global endpoint the `kimi` launcher uses
+  # (api.moonshot.ai); the mainland endpoint would be CNY.
+  amount = f"${available:,.2f}"
+  if available <= 0:
+    amount = red(amount) + " " + red("(OUT OF CREDIT)")
+  elif available < LOW_CREDIT_USD:
+    amount = yellow(amount) + " " + yellow("(low)")
+  else:
+    amount = green(amount)
+
+  print(f"  {bold('kimi')} {dim('(moonshot · prepaid credit)')}")
+  print(f"    {'Balance:':<14}{amount} available"
+        f"  {dim(f'(${cash:,.2f} cash + ${voucher:,.2f} voucher)')}")
+  print()
+
+
+# --- commands ---------------------------------------------------------------
+
+def snapshot(name, quiet=False, force=False, with_browser=True):
+  """Capture the live keychain credential + identity into profile `name`.
+
+  Refuses when the live account isn't the one `name` already refers to. The live
+  credential is shared by every running `claude` session, and any of them can
+  swap it back on a token refresh - so "the live account" is not necessarily the
+  one you last switched to. Without this guard, a `save` issued at the wrong
+  moment silently overwrites a profile's token with a different account's and
+  destroys the only copy (that is exactly how claude2 was lost on 2026-07-23).
+  """
+  blob = keychain_read(LIVE_SERVICE)
+  if not blob:
+    die("no live Claude credential found in the keychain - is `claude` "
+        "logged in? Run /login first.")
+  oauth = current_oauth_account()
+  existing = read_meta(name)
+  if (not force and existing and existing.get("accountUuid")
+      and oauth.get("accountUuid")
+      and existing["accountUuid"] != oauth.get("accountUuid")):
+    die(f"refusing to overwrite profile {name!r}: it holds "
+        f"{existing.get('email') or existing['accountUuid']} but the live "
+        f"account is {account_label(oauth)}.\n"
+        f"  The live account may have been swapped back by another running "
+        f"session. Check with: claude-account current\n"
+        f"  If you really mean to repoint {name!r} at "
+        f"{account_label(oauth)}, re-run with --force.")
+  keychain_write(profile_service(name), blob)
+  meta = {
+      "label": name,
+      "email": oauth.get("emailAddress"),
+      "accountUuid": oauth.get("accountUuid"),
+      "organizationName": oauth.get("organizationName"),
+      "organizationType": oauth.get("organizationType"),
+      "oauthAccount": oauth,
+      "savedAt": int(time.time()),
+  }
+  write_meta(name, meta)
+  if not quiet:
+    who = account_label(oauth)
+    print(green(f"saved") + f" profile {bold(name)} <- {who}")
+  # Also capture the claude.ai browser login so `switch` can restore it. Best
+  # effort - a missing/unauth'd browser never blocks saving the CLI token.
+  #
+  # Callers pass with_browser=False when they must not touch CDP: every
+  # connection costs the user a Chrome "Allow remote debugging?" dialog, and
+  # Chrome refuses to persist that approval (chrome-devtools-mcp#825, closed as
+  # not planned). Keep this to at most one connection per command.
+  if with_browser:
+    browser_snapshot(name, quiet=quiet,
+                     expected_org=oauth.get("organizationUuid"))
+
+
+def cmd_save(args):
+  force = "--force" in args
+  browser_only = "--browser-only" in args
+  names = [a for a in args if a not in ("--force", "--browser-only")]
+  if len(names) != 1:
+    die("usage: claude-account save <name> [--force] [--browser-only]")
+  name = names[0]
+  if browser_only:
+    # Re-capture only the claude.ai session, leaving the stored CLI token
+    # alone. This is the repair for a profile whose CDP form got stripped:
+    # the token is fine, it's the browser snapshot that needs refreshing.
+    meta = read_meta(name)
+    if meta is None:
+      avail = ", ".join(list_profile_names()) or "(none)"
+      die(f"no saved profile {name!r}. Available: {avail}")
+    org = (meta.get("oauthAccount") or {}).get("organizationUuid")
+    browser_snapshot(name, expected_org=org)
+    return
+  snapshot(name, force=force)
+
+
+def cmd_switch(args):
+  do_browser = True
+  positional = []
+  for a in args:
+    if a == "--no-browser":
+      do_browser = False
+    elif a == "--browser-only":
+      # Swap only the browser session, leave the CLI token in place.
+      positional.append(a)
+    else:
+      positional.append(a)
+  browser_only = "--browser-only" in positional
+  positional = [a for a in positional if a != "--browser-only"]
+  if len(positional) != 1:
+    die("usage: claude-account switch <name> [--no-browser | --browser-only]")
+  name = positional[0]
+  if read_meta(name) is None:
+    avail = ", ".join(list_profile_names()) or "(none)"
+    die(f"no saved profile {name!r}. Available: {avail}")
+
+  # The outgoing account, used to re-snapshot its freshest CLI token and browser
+  # session before we overwrite them.
+  current = current_oauth_account()
+  outgoing = find_profile_for_uuid(current.get("accountUuid"))
+
+  if browser_only:
+    browser_switch(name, outgoing)
+    return
+
+  target_blob = keychain_read(profile_service(name))
+  if not target_blob:
+    die(f"profile {name!r} has metadata but no stored credential in the "
+        f"keychain. Re-run: claude-account save {name}")
+
+  # Refresh the outgoing account's snapshot first so its latest (possibly
+  # just-rotated) tokens are preserved before we overwrite the live entry.
+  #
+  # Deliberately CLI-token-only. Each CDP connection costs a Chrome "Allow
+  # remote debugging?" dialog, so the whole command gets at most one: when
+  # do_browser is set, browser_switch() below snapshots the outgoing browser
+  # session itself (and applies the wrong-account guard while it's connected);
+  # when it isn't, --no-browser means leave the browser strictly alone.
+  if outgoing and outgoing != name:
+    snapshot(outgoing, quiet=True, with_browser=False)
+    print(dim(f"(snapshotted outgoing account -> {outgoing})"))
+  elif not outgoing and current.get("accountUuid"):
+    print(yellow(f"note: the current account ({account_label(current)}) isn't "
+                 f"saved as a profile; its refreshed tokens won't be kept. "
+                 f"Save it first with: claude-account save <name>"))
+
+  # Swap the live credential, then update the cosmetic identity to match.
+  keychain_write(LIVE_SERVICE, target_blob)
+  meta = read_meta(name)
+  if meta and meta.get("oauthAccount"):
+    write_oauth_account(meta["oauthAccount"])
+
+  who = account_label(meta.get("oauthAccount", {})) if meta else name
+  print(green("switched") + f" to {bold(name)} ({who})")
+  print(dim("Running sessions pick this up on their next token refresh; open a "
+            "new session for it to take effect immediately."))
+
+  # Follow the CLI swap with the browser session so Chrome and the
+  # Claude-in-Chrome extension act as the same account.
+  if do_browser:
+    browser_switch(name, outgoing)
+
+
+def cmd_remove(args):
+  if len(args) != 1:
+    die("usage: claude-account remove <name>")
+  name = args[0]
+  if read_meta(name) is None and keychain_read(profile_service(name)) is None:
+    die(f"no such profile {name!r}")
+  keychain_delete(profile_service(name))
+  keychain_delete(browser_service(name))
+  try:
+    os.unlink(meta_path(name))
+  except OSError:
+    pass
+  print(green("removed") + f" profile {bold(name)}")
+
+
+def cmd_current(args):
+  oauth = current_oauth_account()
+  if not oauth:
+    print("current account: " + yellow("unknown (no oauthAccount in "
+                                        "~/.claude.json)"))
+    return
+  who = account_label(oauth)
+  match = find_profile_for_uuid(oauth.get("accountUuid"))
+  tag = f" [{bold(match)}]" if match else dim(" (not saved as a profile)")
+  print(f"current account: {bold(who)}{tag}")
+  org = oauth.get("organizationName")
+  if org:
+    print(dim(f"  org: {org}  ({oauth.get('organizationType', '')})"))
+
+
+def cmd_list(args):
+  names = list_profile_names()
+  if not names:
+    print("no saved profiles yet. Save the current account with:")
+    print("  " + bold("claude-account save <name>"))
+    return
+  current_uuid = current_oauth_account().get("accountUuid")
+  print(bold("Saved Claude accounts:"))
+  for name in names:
+    meta = read_meta(name) or {}
+    is_current = meta.get("accountUuid") and meta["accountUuid"] == current_uuid
+    marker = green(" * ") if is_current else "   "
+    email = meta.get("email") or "unknown"
+    saved = meta.get("savedAt")
+    when = ""
+    if saved:
+      age_days = (time.time() - saved) / 86400
+      when = dim(f"  (saved {age_days:.0f}d ago)")
+    has_cred = keychain_read(profile_service(name)) is not None
+    warn = "" if has_cred else red("  [MISSING credential - re-save]")
+    browser = green("  +browser") if read_browser_snapshot(name) else ""
+    label = bold(name) if is_current else name
+    print(f"{marker}{label:<12} {email}{when}{browser}{warn}")
+  print()
+  print(dim("  * = currently active    switch with: "
+            "claude-account switch <name>"))
+
+
+def cmd_quota(args):
+  """Show remaining usage for every saved profile plus the other backends.
+
+  Tokens come straight from the keychain, so this covers whatever profiles are
+  saved with no separate account list to keep in sync. The active account is
+  probed with the live credential (the freshest token); the rest use their last
+  snapshot, which the API keeps honoring well past its nominal expiry.
+  """
+  names = list_profile_names()
+  if args:
+    unknown = [a for a in args if a not in names]
+    if unknown:
+      die(f"no saved profile(s): {', '.join(unknown)}. "
+          f"Available: {', '.join(names) or '(none)'}")
+    names = args
+
+  current_uuid = current_oauth_account().get("accountUuid")
+  print()
+  if not names:
+    print("  " + yellow("no saved Claude profiles - save one with: "
+                        "claude-account save <name>"))
+    print()
+  for name in names:
+    meta = read_meta(name) or {}
+    is_current = bool(current_uuid) and meta.get("accountUuid") == current_uuid
+    # The active account's live entry is kept fresh by Claude Code itself;
+    # a parked profile's snapshot has to be refreshed here before it will probe.
+    if is_current:
+      token, refresh_error = access_token(keychain_read(LIVE_SERVICE)), ""
+    else:
+      blob = keychain_read(profile_service(name))
+      token = access_token(blob)
+      refresh_error = ""
+      if not token or token_expired(blob):
+        token, refresh_error = refresh_profile_token(name)
+    if not token:
+      detail = refresh_error or "no usable credential in the keychain"
+      print(f"  {bold(name)}: {red(detail)}")
+      # Once the refresh token is gone there is nothing left to renew from, so
+      # this profile genuinely needs one interactive login to re-seed.
+      print(dim(f"    re-seed it: /login as this account in Claude, then "
+                f"claude-account save {name}"))
+      print()
+      continue
+    render_account_quota(name, token, is_current)
+
+  render_glm()
+  render_kimi()
+  if names:
+    print(dim("  * = currently active Claude account"))
+    print()
+
+
+def cmd_help(args):
+  print(__doc__)
+
+
+COMMANDS = {
+    "list": cmd_list,
+    "ls": cmd_list,
+    "current": cmd_current,
+    "whoami": cmd_current,
+    "save": cmd_save,
+    "switch": cmd_switch,
+    "use": cmd_switch,
+    "sw": cmd_switch,
+    "remove": cmd_remove,
+    "rm": cmd_remove,
+    "delete": cmd_remove,
+    "quota": cmd_quota,
+    "usage": cmd_quota,
+    "help": cmd_help,
+    "-h": cmd_help,
+    "--help": cmd_help,
+}
+
+
+def main(argv):
+  if not argv:
+    cmd_list([])
+    return
+  cmd = argv[0]
+  handler = COMMANDS.get(cmd)
+  if not handler:
+    die(f"unknown command {cmd!r}. Try: claude-account help")
+  handler(argv[1:])
+
+
+if __name__ == "__main__":
+  main(sys.argv[1:])
