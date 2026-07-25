@@ -1228,9 +1228,12 @@ def cmd_save(args):
       avail = ", ".join(list_profile_names()) or "(none)"
       die(f"no saved profile {name!r}. Available: {avail}")
     org = (meta.get("oauthAccount") or {}).get("organizationUuid")
-    browser_snapshot(name, expected_org=org)
-    return
+    # Same reasoning as `switch --browser-only`: the snapshot is the whole
+    # command, so a refused one is a failed command. A plain `save` stays
+    # best-effort about the browser half - the CLI token is what it's for.
+    return 0 if browser_snapshot(name, expected_org=org) else 1
   snapshot(name, force=force)
+  return 0
 
 
 def cmd_switch(args):
@@ -1259,8 +1262,9 @@ def cmd_switch(args):
   outgoing = find_profile_for_uuid(current.get("accountUuid"))
 
   if browser_only:
-    browser_switch(name, outgoing)
-    return
+    # The browser swap is the whole command here, so its failure is the
+    # command's failure.
+    return 0 if browser_switch(name, outgoing) else 1
 
   target_blob = keychain_read(profile_service(name))
   if not target_blob:
@@ -1295,9 +1299,12 @@ def cmd_switch(args):
             "new session for it to take effect immediately."))
 
   # Follow the CLI swap with the browser session so Chrome and the
-  # Claude-in-Chrome extension act as the same account.
-  if do_browser:
-    browser_switch(name, outgoing)
+  # Claude-in-Chrome extension act as the same account. A failure here leaves
+  # the CLI swapped and the browser not, so report it - the token swap above
+  # has already happened and is not rolled back.
+  if do_browser and not browser_switch(name, outgoing):
+    return 1
+  return 0
 
 
 def cmd_remove(args):
@@ -1436,15 +1443,22 @@ COMMANDS = {
 
 
 def main(argv):
+  """Run a subcommand. Returns the process exit status (0 = success).
+
+  Handlers return non-zero when the thing they were asked to do did not
+  happen. That matters for the browser swap in particular: it can fail while
+  the CLI token swap succeeded, and a wrapper or `&&` chain reading exit 0
+  would take a half-applied switch for a complete one.
+  """
   if not argv:
     cmd_list([])
-    return
+    return 0
   cmd = argv[0]
   handler = COMMANDS.get(cmd)
   if not handler:
     die(f"unknown command {cmd!r}. Try: claude-account help")
-  handler(argv[1:])
+  return handler(argv[1:]) or 0
 
 
 if __name__ == "__main__":
-  main(sys.argv[1:])
+  sys.exit(main(sys.argv[1:]))
