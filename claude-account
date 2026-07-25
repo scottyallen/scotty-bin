@@ -30,7 +30,10 @@ Usage:
                                       (CLI token + claude.ai browser session;
                                        --browser-only skips the CLI token)
   claude-account switch <name>        Swap <name> in as the live account
-                                      (add --no-browser to skip the Chrome swap)
+                                      (--no-browser swaps only the CLI token
+                                       and opens no DevTools connection, so it
+                                       raises no Chrome consent dialog;
+                                       --browser-only swaps only the browser)
   claude-account remove <name>        Delete a saved profile
   claude-account quota [<name>...]    Show usage quota for every saved profile
                                       (plus GLM/Z.ai and Kimi/Moonshot)
@@ -80,6 +83,14 @@ CLAUDE_JSON = os.path.expanduser("~/.claude.json")
 # swapping accounts means rewriting cookies inside one Chrome profile (the
 # Default profile unless overridden). The env var lets a different profile dir
 # (e.g. "Profile 2") be targeted without editing this file.
+#
+# It steers the on-disk path only. The CDP path reads and writes whatever
+# cookie store the browser-level Storage.getCookies resolves to and never
+# consults this, so with the var set to a non-default profile the two paths can
+# disagree - the SQLite form describes the named profile while the CDP form
+# describes whatever Chrome handed back. In practice that means the var is
+# reliable for a stopped Chrome and unverified for a running one. profileDir is
+# recorded in each snapshot but is not checked on restore.
 CHROME_APP = "Google Chrome"
 CHROME_PROFILE_DIR = os.environ.get("CLAUDE_ACCOUNT_CHROME_PROFILE", "Default")
 CHROME_USER_DATA = os.path.expanduser(
@@ -88,6 +99,17 @@ CHROME_USER_DATA = os.path.expanduser(
 # browser and the Claude-in-Chrome extension act as. sessionKey is the auth
 # token; the others keep the org/routing consistent so a swap doesn't leave a
 # half-account state. We snapshot/restore this set as one coherent unit.
+#
+# "As one unit" is true of the capture but not quite of the restore: both
+# restore paths only upsert (Storage.setCookies, INSERT OR REPLACE), neither
+# deletes. A snapshot missing one of these names would therefore leave the
+# outgoing account's copy of it behind. Only sessionKey is actually required at
+# save time, so that is reachable in principle - though every snapshot observed
+# so far carries all four, because claude.ai sets them together at login. Left
+# as-is rather than half-fixed: deleting on the SQLite side is trivial, but the
+# browser-level CDP target has no matching per-cookie delete, and a restore
+# that prunes on one path and not the other is worse than one that prunes on
+# neither.
 BROWSER_COOKIE_NAMES = ("sessionKey", "sessionKeyLC", "lastActiveOrg",
                         "routingHint")
 COOKIE_HOST = ".claude.ai"
@@ -380,12 +402,23 @@ class _WS:
     self._send({"id": mid, "method": method, "params": params or {}})
     while True:
       b0, b1 = self._recv_exact(2)
+      opcode = b0 & 0x0F
       n = b1 & 0x7F
       if n == 126:
         n = struct.unpack(">H", self._recv_exact(2))[0]
       elif n == 127:
         n = struct.unpack(">Q", self._recv_exact(8))[0]
-      msg = json.loads(self._recv_exact(n))
+      payload = self._recv_exact(n)
+      # Control frames aren't JSON. The realistic one here is a close frame
+      # from a Chrome shutting down mid-switch; feeding its 2-byte status code
+      # to json.loads would raise a ValueError that the callers' OSError
+      # handlers miss, surfacing as a traceback after the CLI token has
+      # already been swapped.
+      if opcode == 0x8:
+        raise OSError("DevTools closed the connection")
+      if opcode in (0x9, 0xA):  # ping / pong
+        continue
+      msg = json.loads(payload)
       if msg.get("id") == mid:
         return msg
 
@@ -483,7 +516,13 @@ def read_browser_cookies():
   try:
     # -wal/-shm may hold unflushed rows; copying just the main file is fine for
     # our cookies, which are persistent and long-since flushed.
-    subprocess.run(["cp", src, tmp], capture_output=True)
+    #
+    # A failed copy leaves an empty temp file, which sqlite happily opens as a
+    # valid but schemaless database - so without this check the failure surfaces
+    # much later as a ValueError from cols.index() rather than as the None this
+    # function promises.
+    if subprocess.run(["cp", src, tmp], capture_output=True).returncode != 0:
+      return None
     con = sqlite3.connect(tmp)
     try:
       cols = _cookie_columns(con)
@@ -499,7 +538,9 @@ def read_browser_cookies():
       return rows
     finally:
       con.close()
-  except sqlite3.Error:
+  except (sqlite3.Error, ValueError):
+    # ValueError covers a jar whose `cookies` table lacks the columns we index
+    # by name - a schemaless copy, or a future Chrome that renamed them.
     return None
   finally:
     try:
@@ -728,7 +769,9 @@ def browser_switch(name, outgoing):
       print(red("error: DevTools refused the cookie write; browser session "
                 "unchanged."))
       return False
-    except OSError as e:
+    except (OSError, ValueError) as e:
+      # ValueError catches a malformed DevTools reply (json.loads); without it
+      # the traceback would escape after the CLI token was already swapped.
       print(red(f"error: DevTools connection failed ({e}); browser session "
                 f"unchanged."))
       return False
@@ -1237,18 +1280,16 @@ def cmd_save(args):
 
 
 def cmd_switch(args):
-  do_browser = True
-  positional = []
-  for a in args:
-    if a == "--no-browser":
-      do_browser = False
-    elif a == "--browser-only":
-      # Swap only the browser session, leave the CLI token in place.
-      positional.append(a)
-    else:
-      positional.append(a)
-  browser_only = "--browser-only" in positional
-  positional = [a for a in positional if a != "--browser-only"]
+  # --no-browser swaps only the CLI token; --browser-only swaps only the
+  # browser session. They ask for opposite halves, so passing both is a
+  # contradiction rather than a combination.
+  do_browser = "--no-browser" not in args
+  browser_only = "--browser-only" in args
+  if browser_only and not do_browser:
+    die("--no-browser and --browser-only are contradictory; pass one or "
+        "neither")
+  positional = [a for a in args
+                if a not in ("--no-browser", "--browser-only")]
   if len(positional) != 1:
     die("usage: claude-account switch <name> [--no-browser | --browser-only]")
   name = positional[0]
