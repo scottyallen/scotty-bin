@@ -570,6 +570,17 @@ def write_browser_cookies(rows):
     con.close()
 
 
+def has_session_key(cookies):
+  """True when this capture carries a sessionKey, i.e. an actual session.
+
+  Works for either form: the CDP dicts and the SQLite row dicts both key the
+  cookie name under "name". A capture without a sessionKey is not a session -
+  a logged-out browser still returns lastActiveOrg and routingHint - so storing
+  one over a good snapshot would lose the account while looking like a save.
+  """
+  return any(c.get("name") == "sessionKey" for c in cookies or ())
+
+
 def jar_matches_other_profile(name, rows):
   """The profile whose saved sessionKey the jar's row matches, or None.
 
@@ -611,35 +622,64 @@ def browser_snapshot(name, quiet=False, expected_org=None, cdp_cookies=None):
   move on rather than failing the whole save - the CLI token is the primary
   artifact.
   """
-  payload = {"savedAt": int(time.time()), "profileDir": CHROME_PROFILE_DIR}
+  # Build on the stored snapshot rather than a bare dict, and replace a form
+  # only when this capture actually produced one. The two forms are obtainable
+  # under different conditions - the CDP form needs a running, logged-in Chrome;
+  # the SQLite form needs a readable jar - so a capture that gets one of them
+  # must leave the other alone. Writing a freshly-built payload instead deletes
+  # whichever form was unavailable, and `save <name>` with Chrome closed would
+  # then strip the CDP form and report success: the exact ratchet this file
+  # exists to prevent, reachable from the documented setup command.
+  #
+  # The cost is that a preserved form can be older than the one just captured.
+  # That trade is deliberate. Losing a form is certain damage on an ordinary
+  # command; staleness is conditional (the session has to have rotated) and is
+  # corrected by the next capture that can see that form.
+  payload = read_browser_snapshot(name) or {}
+  payload.pop("cookies", None)  # legacy key; read_browser_snapshot maps it
+  payload.update({"savedAt": int(time.time()),
+                  "profileDir": CHROME_PROFILE_DIR})
 
   if cdp_cookies is not None:
-    payload["cdp"] = cdp_cookies
+    captured = cdp_cookies
   else:
+    captured = None
     ws = cdp_connect()
     if ws:
       try:
-        payload["cdp"] = cdp_get_identity_cookies(ws)
+        captured = cdp_get_identity_cookies(ws)
       except OSError:
         pass
       finally:
         ws.close()
 
-  # When DevTools gave us plaintext we can tell which account the browser is
-  # actually logged into. Refuse to overwrite a saved session with a different
-  # account's - the same class of mistake the CLI guard in snapshot() blocks.
-  if expected_org and payload.get("cdp"):
-    live_org = next((c["value"] for c in payload["cdp"]
+  # Which forms this capture actually refreshed. Empty means nothing was
+  # learned, so the stored entry is left exactly as it was.
+  fresh = []
+  problem = None
+
+  if has_session_key(captured):
+    # When DevTools gave us plaintext we can tell which account the browser is
+    # actually logged into. Refuse to overwrite a saved session with a different
+    # account's - the same class of mistake the CLI guard in snapshot() blocks.
+    live_org = next((c["value"] for c in captured
                      if c["name"] == "lastActiveOrg"), None)
-    if live_org and live_org != expected_org:
-      if not quiet:
-        print(yellow(f"note: the browser is logged into org {live_org}, not "
-                     f"{name}'s org {expected_org}; browser session NOT saved "
-                     f"(log claude.ai into the right account first)"))
+    if expected_org and live_org and live_org != expected_org:
+      # Always printed, even when `quiet` silences the success line: this one
+      # tells the user to log claude.ai into a different account, which no
+      # generic "not snapshotted" note would convey.
+      print(yellow(f"note: the browser is logged into org {live_org}, not "
+                   f"{name}'s org {expected_org}; browser session NOT saved "
+                   f"(log claude.ai into the right account first)"))
       return False
+    payload["cdp"] = captured
+    fresh.append("live browser")
+  elif captured is not None:
+    problem = (f"Chrome is running but has no claude.ai sessionKey (logged "
+               f"out); {name}'s stored session is unchanged")
 
   rows = read_browser_cookies()
-  if rows:
+  if has_session_key(rows):
     # The org guard above can only run when DevTools handed us plaintext. With
     # Chrome stopped there is no CDP form, and the jar's values are Safe-Storage
     # encrypted, so the account behind them can't be read directly. A byte
@@ -649,30 +689,33 @@ def browser_snapshot(name, quiet=False, expected_org=None, cdp_cookies=None):
     # isn't this account's.
     owner = jar_matches_other_profile(name, rows)
     if owner:
-      if not quiet:
-        print(yellow(f"note: the on-disk cookie jar holds {owner}'s session, "
-                     f"not {name}'s; browser session NOT saved (a previous "
-                     f"`switch --no-browser` leaves the browser on another "
-                     f"account)"))
-      return False
-    payload["sqlite"] = rows
+      # Only the jar is in doubt. A CDP form that passed the org check above is
+      # positive proof of the account, so skip these rows and keep going rather
+      # than discarding a capture that was already validated. Reachable through
+      # the flush delay: right after a live swap the jar can still hold the
+      # previous account's rows.
+      print(yellow(f"note: the on-disk cookie jar holds {owner}'s session, not "
+                   f"{name}'s; keeping {name}'s stored jar rows (a previous "
+                   f"`switch --no-browser` leaves the browser on another "
+                   f"account)"))
+    else:
+      payload["sqlite"] = rows
+      fresh.append("on-disk jar")
 
-  names = {c["name"] for c in payload.get("cdp", [])} \
-      | {r["name"] for r in payload.get("sqlite", [])}
-  if "sessionKey" not in names:
-    if not quiet:
-      hint = ("" if payload.get("cdp") else
-              " (Chrome not running / DevTools unreachable, and the on-disk jar"
-              " had none either)")
-      print(yellow(f"note: Chrome profile {CHROME_PROFILE_DIR!r} has no "
-                   f"claude.ai sessionKey; browser session not saved{hint}"))
+  if not fresh:
+    if problem is None:
+      problem = (f"no claude.ai sessionKey available for {name} - Chrome isn't "
+                 f"running or DevTools is unreachable, and the on-disk jar had "
+                 f"none either")
+    print(yellow(f"note: {problem}"))
     return False
 
   keychain_write(browser_service(name), json.dumps(payload))
   if not quiet:
-    how = "live browser" if payload.get("cdp") else "on-disk jar"
+    names = {c["name"] for c in payload.get("cdp", [])} \
+        | {r["name"] for r in payload.get("sqlite", [])}
     print(green("saved") + f" browser session for {bold(name)} "
-          f"({len(names)} cookies via {how})")
+          f"({len(names)} cookies via {' + '.join(fresh)})")
   return True
 
 
@@ -758,9 +801,8 @@ def browser_switch(name, outgoing):
                             expected_org=outgoing_org(outgoing),
                             cdp_cookies=cdp_get_identity_cookies(ws)):
           print(dim(f"(snapshotted outgoing browser session -> {outgoing})"))
-        else:
-          print(yellow(f"note: outgoing browser session not snapshotted; "
-                       f"{outgoing}'s saved session is unchanged"))
+        # No generic note on failure: browser_snapshot() prints the specific
+        # reason itself, and the four reasons imply four different fixes.
 
       if cdp_set_cookies(ws, snap["cdp"]):
         print(green("switched") + f" browser session to {bold(name)}"
@@ -801,9 +843,7 @@ def browser_switch(name, outgoing):
     if browser_snapshot(outgoing, quiet=True,
                         expected_org=outgoing_org(outgoing)):
       print(dim(f"(snapshotted outgoing browser session -> {outgoing})"))
-    else:
-      print(yellow(f"note: outgoing browser session not snapshotted; "
-                   f"{outgoing}'s saved session is unchanged"))
+    # browser_snapshot() explains its own failures - see the live path above.
 
   try:
     write_browser_cookies(snap["sqlite"])
