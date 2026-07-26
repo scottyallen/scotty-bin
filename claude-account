@@ -1424,9 +1424,13 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
       stored_token = access_token(stored_blob)
       # A corrupt blob reaches here too - both extractors swallow the parse
       # error - so say which of the two it is rather than reporting a
-      # malformed credential as an empty one.
-      probe_error = ("stored credential is not valid JSON"
-                     if not credential_oauth(stored_blob) else
+      # malformed credential as an empty one. `is None` rather than falsy for
+      # the same reason as the profile payload check above: a blob of `{}`
+      # parses to an empty dict, which is exactly the "readable but carries
+      # nothing" case this arm exists to name, and falsy would send it to the
+      # arm that calls it malformed.
+      probe_error = ("stored credential is unreadable (not a JSON object)"
+                     if credential_oauth(stored_blob) is None else
                      "stored credential has neither a refresh nor an access "
                      "token")
     stored_identity, stored_error = (
