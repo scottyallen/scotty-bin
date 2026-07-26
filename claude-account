@@ -1380,9 +1380,26 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
   # that same untrusted uuid. So when the record isn't authoritative, ask the
   # stored credential who it belongs to and compare credential to credential -
   # the metadata drops out of the decision entirely.
-  if verified and existing and not existing_authoritative and not force:
-    stored_identity, stored_error = verified_identity(
-        keychain_read(profile_service(name)))
+  # The keychain_read() in the condition is the "is there anything to protect"
+  # test: metadata with no stored credential has nothing to destroy, so it
+  # saves as freely as a new profile. Refusing there would also block the
+  # repair this tool prescribes for that exact state, since cmd_switch tells
+  # the user to run `claude-account save <name>` to fix it.
+  if (verified and existing and not existing_authoritative and not force
+      and keychain_read(profile_service(name))):
+    # A stored access token is stale by design - Claude Code refreshes only the
+    # live credential, so any profile not switched to recently has a dead one,
+    # and this branch inspects exactly such a profile. Refresh before spending
+    # it, or the common case fails the check for a reason that has nothing to
+    # do with which account it is. refresh_profile_token() persists the rotated
+    # token itself, and borrows the live access token when the refresh tokens
+    # are shared, so this can neither brick the profile nor log out running
+    # sessions.
+    stored_token, refresh_error = refresh_profile_token(name)
+    stored_identity, stored_error = (
+        verified_identity(json.dumps({"claudeAiOauth": {
+            "accessToken": stored_token}}))
+        if stored_token else (None, refresh_error))
     if stored_identity is None:
       msg = (f"refusing to overwrite profile {name!r}: its stored identity was "
              f"never verified, and its stored credential can't be checked "
