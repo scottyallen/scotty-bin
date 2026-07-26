@@ -1395,11 +1395,24 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
     # token itself, and borrows the live access token when the refresh tokens
     # are shared, so this can neither brick the profile nor log out running
     # sessions.
-    stored_token, refresh_error = refresh_profile_token(name)
+    #
+    # A blob with no refresh token has nothing to rotate, so spend its access
+    # token as-is instead of refusing. Claude Code always writes a refresh
+    # token, so this is unusual - but the access token may still be live, and
+    # turning "unusual" into "refused" would make the check strictly less
+    # capable than it was before the refresh was added, for no safety gain. If
+    # that token is dead the probe fails and we refuse anyway, which is the
+    # same answer by the honest route.
+    stored_blob = keychain_read(profile_service(name))
+    if refresh_token_of(stored_blob):
+      stored_token, probe_error = refresh_profile_token(name)
+    else:
+      stored_token = access_token(stored_blob)
+      probe_error = "stored credential has neither a refresh nor an access token"
     stored_identity, stored_error = (
         verified_identity(json.dumps({"claudeAiOauth": {
             "accessToken": stored_token}}))
-        if stored_token else (None, refresh_error))
+        if stored_token else (None, probe_error))
     if stored_identity is None:
       msg = (f"refusing to overwrite profile {name!r}: its stored identity was "
              f"never verified, and its stored credential can't be checked "
