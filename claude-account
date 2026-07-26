@@ -1371,6 +1371,46 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
   # tool's own unverified write locks the user out of correcting it.
   existing_authoritative = bool(existing) and existing.get(
       "identityVerified", True)
+
+  # But not trusting it to refuse while still trusting it to permit is the
+  # worse half of the same mistake: a record mis-stamped with the live
+  # account's uuid matches, no mismatch fires, and the stored credential is
+  # replaced by a different account's in silence. Reachable through a plain
+  # `switch`, since find_profile_for_uuid() resolves the outgoing profile by
+  # that same untrusted uuid. So when the record isn't authoritative, ask the
+  # stored credential who it belongs to and compare credential to credential -
+  # the metadata drops out of the decision entirely.
+  if verified and existing and not existing_authoritative and not force:
+    stored_identity, stored_error = verified_identity(
+        keychain_read(profile_service(name)))
+    if stored_identity is None:
+      msg = (f"refusing to overwrite profile {name!r}: its stored identity was "
+             f"never verified, and its stored credential can't be checked "
+             f"either ({stored_error}).\n"
+             f"  Without one or the other there is no way to tell whether this "
+             f"save would replace a different account's credential.\n"
+             f"  Retry when the API is reachable, or re-run with --force.")
+      if optional:
+        print(yellow(f"note: {msg.splitlines()[0]}"))
+        print(dim(f"  {name}'s stored credential is unchanged; the switch "
+                  f"continues."))
+        return False
+      die(msg)
+    if stored_identity["accountUuid"] != oauth.get("accountUuid"):
+      msg = (f"refusing to overwrite profile {name!r}: its stored credential "
+             f"belongs to {account_label(stored_identity)}, but the live one "
+             f"belongs to {account_label(oauth)}.\n"
+             f"  Its metadata says otherwise, but that record was written "
+             f"without verification - the credentials themselves disagree.\n"
+             f"  If you really mean to repoint {name!r} at "
+             f"{account_label(oauth)}, re-run with --force.")
+      if optional:
+        print(yellow(f"note: {msg.splitlines()[0]}"))
+        print(dim(f"  {name}'s stored credential is unchanged; the switch "
+                  f"continues."))
+        return False
+      die(msg)
+
   if (not force and existing and existing.get("accountUuid")
       and oauth.get("accountUuid")
       and existing["accountUuid"] != oauth.get("accountUuid")):
@@ -1426,6 +1466,7 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
   if with_browser:
     browser_snapshot(name, quiet=quiet,
                      expected_org=oauth.get("organizationUuid"))
+  return True
 
 
 def cmd_save(args):
@@ -1500,8 +1541,10 @@ def cmd_switch(args):
   # session itself (and applies the wrong-account guard while it's connected);
   # when it isn't, --no-browser means leave the browser strictly alone.
   if outgoing and outgoing != name:
-    snapshot(outgoing, quiet=True, with_browser=False, optional=True)
-    print(dim(f"(snapshotted outgoing account -> {outgoing})"))
+    # Only claim the snapshot happened if it did - an optional save returns
+    # False when it declines, having already explained why.
+    if snapshot(outgoing, quiet=True, with_browser=False, optional=True):
+      print(dim(f"(snapshotted outgoing account -> {outgoing})"))
   elif not outgoing and current.get("accountUuid"):
     print(yellow(f"note: the current account ({account_label(current)}) isn't "
                  f"saved as a profile; its refreshed tokens won't be kept. "
