@@ -328,6 +328,12 @@ def credential_oauth(blob):
     data = json.loads(blob)
   except ValueError:
     return None
+  # Valid JSON is not necessarily an object: `[]`, `42` and `null` all parse,
+  # and .get() on them raises rather than returning None. Check before reaching
+  # for the key, so "unreadable" covers every way a blob can fail to be a
+  # credential rather than only the ways that happen to fail politely.
+  if not isinstance(data, dict):
+    return None
   oauth = data.get("claudeAiOauth") or data
   return oauth if isinstance(oauth, dict) else None
 
