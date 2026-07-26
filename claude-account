@@ -294,15 +294,7 @@ def refresh_profile_token(name):
 
 def refresh_token_of(blob):
   """The refresh token inside a credential blob, or None."""
-  if not blob:
-    return None
-  try:
-    data = json.loads(blob)
-  except ValueError:
-    return None
-  oauth = data.get("claudeAiOauth") or data
-  token = oauth.get("refreshToken")
-  return token if isinstance(token, str) and token else None
+  return _credential_token(blob, "refreshToken")
 
 
 def token_expired(blob):
@@ -318,11 +310,17 @@ def token_expired(blob):
   return float(expires_at) / 1000.0 <= time.time()
 
 
-def access_token(blob):
-  """Pull the OAuth access token out of a stored credential blob.
+def credential_oauth(blob):
+  """The OAuth object inside a stored credential blob, or None if unreadable.
 
   The blob is Claude Code's own keychain JSON: {"claudeAiOauth": {...}}. Older
   or hand-made entries have sometimes been flat, so accept that shape too.
+
+  Callers that only want a token go through access_token()/refresh_token_of(),
+  which return None for a blob that is missing, corrupt, or simply lacks that
+  token. This distinguishes the first two from the third, which the token
+  extractors deliberately don't - a caller reporting *why* a credential can't
+  be used needs to tell a malformed entry from an empty one.
   """
   if not blob:
     return None
@@ -331,8 +329,18 @@ def access_token(blob):
   except ValueError:
     return None
   oauth = data.get("claudeAiOauth") or data
-  token = oauth.get("accessToken")
+  return oauth if isinstance(oauth, dict) else None
+
+
+def _credential_token(blob, key):
+  oauth = credential_oauth(blob) or {}
+  token = oauth.get(key)
   return token if isinstance(token, str) and token else None
+
+
+def access_token(blob):
+  """Pull the OAuth access token out of a stored credential blob."""
+  return _credential_token(blob, "accessToken")
 
 
 # --- CDP: talk to a LIVE Chrome so a switch needs no restart -----------------
@@ -1408,18 +1416,32 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
       stored_token, probe_error = refresh_profile_token(name)
     else:
       stored_token = access_token(stored_blob)
-      probe_error = "stored credential has neither a refresh nor an access token"
+      # A corrupt blob reaches here too - both extractors swallow the parse
+      # error - so say which of the two it is rather than reporting a
+      # malformed credential as an empty one.
+      probe_error = ("stored credential is not valid JSON"
+                     if not credential_oauth(stored_blob) else
+                     "stored credential has neither a refresh nor an access "
+                     "token")
     stored_identity, stored_error = (
         verified_identity(json.dumps({"claudeAiOauth": {
             "accessToken": stored_token}}))
         if stored_token else (None, probe_error))
     if stored_identity is None:
+      # "Retry when the API is reachable" only helps when the API is what
+      # failed. A blob with no usable token at all is a local problem that no
+      # amount of retrying fixes.
+      remedy = ("Re-save it with --force once the right account is live, or "
+                "re-run with --force to save over it now."
+                if not (refresh_token_of(stored_blob)
+                        or access_token(stored_blob)) else
+                "Retry when the API is reachable, or re-run with --force.")
       msg = (f"refusing to overwrite profile {name!r}: its stored identity was "
              f"never verified, and its stored credential can't be checked "
              f"either ({stored_error}).\n"
              f"  Without one or the other there is no way to tell whether this "
              f"save would replace a different account's credential.\n"
-             f"  Retry when the API is reachable, or re-run with --force.")
+             f"  {remedy}")
       if optional:
         print(yellow(f"note: {msg.splitlines()[0]}"))
         print(dim(f"  {name}'s stored credential is unchanged; the switch "
