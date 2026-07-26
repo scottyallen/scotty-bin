@@ -1144,17 +1144,22 @@ def http_get_json(url, api_key):
 def verified_identity(blob):
   """Ask the API which account a credential blob belongs to.
 
-  Returns an oauthAccount-shaped dict, or (None, error) if the question can't
-  be answered - offline, or a token too dead to spend. This is the only source
-  of identity that is actually tied to the credential: ~/.claude.json's
-  oauthAccount is written by whoever ran last and can describe a different
-  account than the keychain holds.
+  Always returns a (identity, error) pair: an oauthAccount-shaped dict with an
+  empty error on success, or (None, reason) when the question can't be answered
+  - offline, or a token too dead to spend. This is the only source of identity
+  that is actually tied to the credential: ~/.claude.json's oauthAccount is
+  written by whoever ran last and can describe a different account than the
+  keychain holds.
   """
   token = access_token(blob)
   if not token:
     return None, "no access token in the credential blob"
   payload, error = http_get_json(OAUTH_PROFILE_URL, token)
-  if not payload:
+  # `is None` rather than falsy: a 200 carrying an empty body is a successful
+  # request with an empty error string, and treating it as a transport failure
+  # would report the refusal with an empty parenthetical. Falling through gives
+  # the missing-uuid check below a chance to supply a real reason.
+  if payload is None:
     return None, error
   account = payload.get("account") or {}
   org = payload.get("organization") or {}
@@ -1286,7 +1291,7 @@ def render_kimi():
 
 # --- commands ---------------------------------------------------------------
 
-def snapshot(name, quiet=False, force=False, with_browser=True):
+def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
   """Capture the live keychain credential + identity into profile `name`.
 
   Refuses when the live account isn't the one `name` already refers to. The live
@@ -1306,6 +1311,13 @@ def snapshot(name, quiet=False, force=False, with_browser=True):
   When the API can't be reached, an existing profile is not overwritten at all:
   unverifiable is treated as unsafe, because the failure being guarded against
   destroys the only local copy of a credential.
+
+  `optional=True` marks a save the caller can do without - `switch` refreshing
+  the outgoing profile, which exists only to catch a token that rotated since
+  the last save. Skipping it costs that profile nothing; it keeps the snapshot
+  it already had. So an optional save reports and returns False where a
+  user-requested one would die, because refusing to refresh must never be a
+  reason the switch itself can't happen.
   """
   blob = keychain_read(LIVE_SERVICE)
   if not blob:
@@ -1320,32 +1332,69 @@ def snapshot(name, quiet=False, force=False, with_browser=True):
     # Keep ~/.claude.json's extra cosmetic fields (displayName, billingType and
     # friends, which Claude Code shows) but only when it agrees about who this
     # is; the verified values always win on the fields that decide anything.
+    # Empty values are dropped first: only accountUuid is non-empty by
+    # construction, and letting a missing organizationUuid overwrite a good one
+    # would hand browser_snapshot an expected_org of None, which silently
+    # disables the browser-side wrong-account guard.
     agrees = json_oauth.get("accountUuid") == verified["accountUuid"]
-    oauth = {**json_oauth, **verified} if agrees else dict(verified)
+    present = {k: v for k, v in verified.items() if v}
+    oauth = {**json_oauth, **present} if agrees else dict(present)
   else:
     if existing and not force:
-      die(f"refusing to overwrite profile {name!r}: cannot verify which "
-          f"account the live credential belongs to ({verify_error}).\n"
-          f"  The check needs the API because the keychain blob carries no "
-          f"identity of its own. Saving blind could overwrite {name!r}'s "
-          f"stored credential with a different account's.\n"
-          f"  Retry when online, or re-run with --force to save anyway.")
+      # A lapsed access token and a missing network fail identically here, and
+      # they need opposite fixes, so name the one we can detect.
+      remedy = ("Run `claude` once to refresh the live token, or re-run with "
+                "--force to save anyway."
+                if token_expired(blob) else
+                "Retry when online, or re-run with --force to save anyway.")
+      msg = (f"refusing to overwrite profile {name!r}: cannot verify which "
+             f"account the live credential belongs to ({verify_error}).\n"
+             f"  The check needs the API because the keychain blob carries no "
+             f"identity of its own. Saving blind could overwrite {name!r}'s "
+             f"stored credential with a different account's.\n"
+             f"  {remedy}")
+      if optional:
+        # Best-effort refresh: skip it and let the caller carry on.
+        print(yellow(f"note: {msg.splitlines()[0]}"))
+        print(dim(f"  {name}'s stored credential is unchanged; the switch "
+                  f"continues."))
+        return False
+      die(msg)
     # A brand-new profile has nothing to destroy, so fall back to the
     # unverified identity rather than blocking the first save.
     oauth = json_oauth
     print(yellow(f"note: could not verify the live account ({verify_error}); "
                  f"recording the identity from ~/.claude.json unverified"))
 
+  # An `identityVerified: False` record was written without proof, so it is not
+  # grounds for refusing a save whose identity we HAVE proven - otherwise the
+  # tool's own unverified write locks the user out of correcting it.
+  existing_authoritative = bool(existing) and existing.get(
+      "identityVerified", True)
   if (not force and existing and existing.get("accountUuid")
       and oauth.get("accountUuid")
       and existing["accountUuid"] != oauth.get("accountUuid")):
-    die(f"refusing to overwrite profile {name!r}: it holds "
-        f"{existing.get('email') or existing['accountUuid']} but the live "
-        f"credential belongs to {account_label(oauth)}.\n"
-        f"  The live account may have been swapped back by another running "
-        f"session. Check with: claude-account current\n"
-        f"  If you really mean to repoint {name!r} at "
-        f"{account_label(oauth)}, re-run with --force.")
+    if verified and not existing_authoritative:
+      print(yellow(f"note: replacing {name!r}'s unverified identity "
+                   f"({existing.get('email') or existing['accountUuid']}) with "
+                   f"the verified {account_label(oauth)}"))
+    else:
+      unverified_hint = ("" if existing_authoritative else
+                         f"\n  {name!r}'s stored identity was never verified, "
+                         f"so --force is likely the right call here.")
+      msg = (f"refusing to overwrite profile {name!r}: it holds "
+             f"{existing.get('email') or existing['accountUuid']} but the live "
+             f"credential belongs to {account_label(oauth)}.\n"
+             f"  The live account may have been swapped back by another running "
+             f"session. Check with: claude-account current\n"
+             f"  If you really mean to repoint {name!r} at "
+             f"{account_label(oauth)}, re-run with --force.{unverified_hint}")
+      if optional:
+        print(yellow(f"note: {msg.splitlines()[0]}"))
+        print(dim(f"  {name}'s stored credential is unchanged; the switch "
+                  f"continues."))
+        return False
+      die(msg)
   keychain_write(profile_service(name), blob)
   meta = {
       "label": name,
@@ -1354,12 +1403,19 @@ def snapshot(name, quiet=False, force=False, with_browser=True):
       "organizationName": oauth.get("organizationName"),
       "organizationType": oauth.get("organizationType"),
       "oauthAccount": oauth,
+      # Whether this identity was proven against the credential or merely
+      # copied from ~/.claude.json. Load-bearing: the mismatch guard above,
+      # `list`/`current`, and find_profile_for_uuid() all treat the stored
+      # accountUuid as ground truth, so a record that was never verified has to
+      # say so rather than be indistinguishable from one that was.
+      "identityVerified": bool(verified),
       "savedAt": int(time.time()),
   }
   write_meta(name, meta)
   if not quiet:
     who = account_label(oauth)
-    print(green(f"saved") + f" profile {bold(name)} <- {who}")
+    mark = "" if verified else dim(" (identity unverified)")
+    print(green(f"saved") + f" profile {bold(name)} <- {who}{mark}")
   # Also capture the claude.ai browser login so `switch` can restore it. Best
   # effort - a missing/unauth'd browser never blocks saving the CLI token.
   #
@@ -1444,7 +1500,7 @@ def cmd_switch(args):
   # session itself (and applies the wrong-account guard while it's connected);
   # when it isn't, --no-browser means leave the browser strictly alone.
   if outgoing and outgoing != name:
-    snapshot(outgoing, quiet=True, with_browser=False)
+    snapshot(outgoing, quiet=True, with_browser=False, optional=True)
     print(dim(f"(snapshotted outgoing account -> {outgoing})"))
   elif not outgoing and current.get("accountUuid"):
     print(yellow(f"note: the current account ({account_label(current)}) isn't "
