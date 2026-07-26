@@ -294,15 +294,7 @@ def refresh_profile_token(name):
 
 def refresh_token_of(blob):
   """The refresh token inside a credential blob, or None."""
-  if not blob:
-    return None
-  try:
-    data = json.loads(blob)
-  except ValueError:
-    return None
-  oauth = data.get("claudeAiOauth") or data
-  token = oauth.get("refreshToken")
-  return token if isinstance(token, str) and token else None
+  return _credential_token(blob, "refreshToken")
 
 
 def token_expired(blob):
@@ -318,11 +310,17 @@ def token_expired(blob):
   return float(expires_at) / 1000.0 <= time.time()
 
 
-def access_token(blob):
-  """Pull the OAuth access token out of a stored credential blob.
+def credential_oauth(blob):
+  """The OAuth object inside a stored credential blob, or None if unreadable.
 
   The blob is Claude Code's own keychain JSON: {"claudeAiOauth": {...}}. Older
   or hand-made entries have sometimes been flat, so accept that shape too.
+
+  Callers that only want a token go through access_token()/refresh_token_of(),
+  which return None for a blob that is missing, corrupt, or simply lacks that
+  token. This distinguishes the first two from the third, which the token
+  extractors deliberately don't - a caller reporting *why* a credential can't
+  be used needs to tell a malformed entry from an empty one.
   """
   if not blob:
     return None
@@ -330,9 +328,25 @@ def access_token(blob):
     data = json.loads(blob)
   except ValueError:
     return None
+  # Valid JSON is not necessarily an object: `[]`, `42` and `null` all parse,
+  # and .get() on them raises rather than returning None. Check before reaching
+  # for the key, so "unreadable" covers every way a blob can fail to be a
+  # credential rather than only the ways that happen to fail politely.
+  if not isinstance(data, dict):
+    return None
   oauth = data.get("claudeAiOauth") or data
-  token = oauth.get("accessToken")
+  return oauth if isinstance(oauth, dict) else None
+
+
+def _credential_token(blob, key):
+  oauth = credential_oauth(blob) or {}
+  token = oauth.get(key)
   return token if isinstance(token, str) and token else None
+
+
+def access_token(blob):
+  """Pull the OAuth access token out of a stored credential blob."""
+  return _credential_token(blob, "accessToken")
 
 
 # --- CDP: talk to a LIVE Chrome so a switch needs no restart -----------------
@@ -1395,18 +1409,49 @@ def snapshot(name, quiet=False, force=False, with_browser=True, optional=False):
     # token itself, and borrows the live access token when the refresh tokens
     # are shared, so this can neither brick the profile nor log out running
     # sessions.
-    stored_token, refresh_error = refresh_profile_token(name)
+    #
+    # A blob with no refresh token has nothing to rotate, so spend its access
+    # token as-is instead of refusing. Claude Code always writes a refresh
+    # token, so this is unusual - but the access token may still be live, and
+    # turning "unusual" into "refused" would make the check strictly less
+    # capable than it was before the refresh was added, for no safety gain. If
+    # that token is dead the probe fails and we refuse anyway, which is the
+    # same answer by the honest route.
+    stored_blob = keychain_read(profile_service(name))
+    if refresh_token_of(stored_blob):
+      stored_token, probe_error = refresh_profile_token(name)
+    else:
+      stored_token = access_token(stored_blob)
+      # A corrupt blob reaches here too - both extractors swallow the parse
+      # error - so say which of the two it is rather than reporting a
+      # malformed credential as an empty one. `is None` rather than falsy for
+      # the same reason as the profile payload check above: a blob of `{}`
+      # parses to an empty dict, which is exactly the "readable but carries
+      # nothing" case this arm exists to name, and falsy would send it to the
+      # arm that calls it malformed.
+      probe_error = ("stored credential is unreadable (not a JSON object)"
+                     if credential_oauth(stored_blob) is None else
+                     "stored credential has neither a refresh nor an access "
+                     "token")
     stored_identity, stored_error = (
         verified_identity(json.dumps({"claudeAiOauth": {
             "accessToken": stored_token}}))
-        if stored_token else (None, refresh_error))
+        if stored_token else (None, probe_error))
     if stored_identity is None:
+      # "Retry when the API is reachable" only helps when the API is what
+      # failed. A blob with no usable token at all is a local problem that no
+      # amount of retrying fixes.
+      remedy = ("Re-save it with --force once the right account is live, or "
+                "re-run with --force to save over it now."
+                if not (refresh_token_of(stored_blob)
+                        or access_token(stored_blob)) else
+                "Retry when the API is reachable, or re-run with --force.")
       msg = (f"refusing to overwrite profile {name!r}: its stored identity was "
              f"never verified, and its stored credential can't be checked "
              f"either ({stored_error}).\n"
              f"  Without one or the other there is no way to tell whether this "
              f"save would replace a different account's credential.\n"
-             f"  Retry when the API is reachable, or re-run with --force.")
+             f"  {remedy}")
       if optional:
         print(yellow(f"note: {msg.splitlines()[0]}"))
         print(dim(f"  {name}'s stored credential is unchanged; the switch "
