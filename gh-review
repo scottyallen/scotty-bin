@@ -204,7 +204,19 @@ if [ "${1:-}" = "api" ]; then
   # whichever one was used, and refuse outright when it can't be read. An
   # unscannable query is the one case where letting it through would
   # silently undo every check above.
+  #
+  # Scoped to the graphql endpoint, and it must stay that way. A REST call's
+  # `--input` is a request body, not a query: feeding one to the scanner
+  # below refuses ordinary review posts, because a review payload is prose
+  # *about* code and so trips both the mutation-name check and (for
+  # `--input -`) the unresolvable-query check. That is how the reviewer
+  # posts inline comments, so breaking it breaks the lane this wrapper
+  # exists to serve.
   qtext=""; qunresolved=""
+  case "$path" in
+    graphql|/graphql) ;;            # fall through to the resolution below
+    *) input_file=""; qfield="" ;;  # a REST body is not a graphql query
+  esac
   if [ -n "$input_file" ]; then
     if [ "$input_file" = "-" ]; then qunresolved=1
     elif [ -r "$input_file" ]; then qtext="$qtext $(cat "$input_file")"
@@ -218,7 +230,7 @@ if [ "${1:-}" = "api" ]; then
     ?*)    qtext="$qtext $qfield" ;;
   esac
 
-  if [ "$path" = "graphql" ] || [ "$path" = "/graphql" ] || [ -n "$qtext" ] || [ -n "$qunresolved" ]; then
+  if [ -n "$qtext" ] || [ -n "$qunresolved" ]; then
     if [ -n "$qunresolved" ]; then
       die "refusing a graphql call whose query text cannot be inspected (--input -, @-, or an unreadable file)."
     fi
@@ -231,7 +243,15 @@ if [ "${1:-}" = "api" ]; then
         # the operation name and its variable list aren't mistaken for
         # mutation fields, then take every `name(` in the selection set.
         qbody="${qtext#*\{}"
-        mutations="$(printf '%s' "$qbody" | grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' | sed -E 's/[[:space:]]*\($//')"
+        # Strip string literals first. `addPullRequestReviewThread` carries
+        # the comment body inside the mutation, and a code-review comment
+        # nearly always names a function - without this, a body reading
+        # "check() returns the wrong code" is refused as a mutation called
+        # `check`. A name inside a string is data and cannot execute, so
+        # dropping literals costs no safety. Escaped quotes go first so they
+        # can't throw off the pairing.
+        qscan="$(printf '%s' "$qbody" | sed -E 's/\\"//g; s/"[^"]*"//g')"
+        mutations="$(printf '%s' "$qscan" | grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' | sed -E 's/[[:space:]]*\($//')"
         [ -z "$mutations" ] && die "refusing a graphql mutation whose fields could not be parsed - refusing rather than guessing."
         for m in $mutations; do
           case "$m" in

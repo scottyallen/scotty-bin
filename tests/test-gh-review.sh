@@ -27,16 +27,23 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 printf '%s' 'mutation { mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }' > "$TMP/merge.graphql"
 printf '%s' '{"query":"mutation { mergePullRequest(input:{pullRequestId:\"x\"}) { clientMutationId } }"}' > "$TMP/merge.json"
+# A realistic review payload: prose *about* code. It mentions a mutation and
+# contains `name(`, which is exactly what a round of review on this wrapper
+# looks like - and is how the round-1 review of this PR was actually posted.
+printf '%s' '{"event":"COMMENT","body":"refusing a merge mutation - the check() helper reads the wrong exit code"}' > "$TMP/review.json"
 
 check() {
   local want="$1" desc="$2"; shift 2
-  "$GH_REVIEW" "$@" >/dev/null 2>&1
+  # stdin from /dev/null so a case that legitimately reaches `gh` with
+  # `--input -` returns instead of blocking on a terminal read.
+  "$GH_REVIEW" "$@" >/dev/null 2>&1 </dev/null
   local rc=$?
   local got
   case $rc in
-    3)   got="BLOCKED" ;;
-    2|4) got="WRAPPER-ERROR" ;;   # usage / missing token - never a pass
-    *)   got="allowed" ;;
+    3)       got="BLOCKED" ;;
+    2|4)     got="WRAPPER-ERROR" ;;   # usage / missing token - never a pass
+    127)     got="WRAPPER-ERROR" ;;   # `exec gh` failed - gh not on PATH
+    *)       got="allowed" ;;
   esac
   if [ "$got" = "$want" ]; then
     printf '  ok    %-9s %s\n' "$got" "$desc"; pass=$((pass+1))
@@ -44,6 +51,35 @@ check() {
     printf '  FAIL  got=%-13s want=%-9s %s\n' "$got" "$want" "$desc"; fail=$((fail+1))
   fi
 }
+
+# Positive control. The preflight proves a token EXISTS; it does not prove
+# any call gets past the wrapper's final `exec gh`. Without this, a wrapper
+# broken in a way that never reaches gh scores a perfect allow half - the
+# same class of vacuity as the tokenless run, one step further down. A stub
+# gh that exits 42 makes "reached gh" an observable, distinct from "did not
+# exit 3".
+STUB="$TMP/stub"
+mkdir -p "$STUB"
+printf '#!/bin/sh\nexit 42\n' > "$STUB/gh"
+chmod +x "$STUB/gh"
+
+reaches_gh() {
+  local desc="$1"; shift
+  PATH="$STUB:$PATH" "$GH_REVIEW" "$@" >/dev/null 2>&1 </dev/null
+  local rc=$?
+  if [ "$rc" -eq 42 ]; then
+    printf '  ok    %-11s %s\n' "reached-gh" "$desc"; pass=$((pass+1))
+  else
+    printf '  FAIL  got=exit-%-5s want=reached-gh  %s\n' "$rc" "$desc"; fail=$((fail+1))
+  fi
+}
+
+echo "POSITIVE CONTROL - allow-side calls really reach gh:"
+reaches_gh "api user"                       api user
+reaches_gh "POST pulls/N/reviews"           api -X POST "repos/$R/pulls/999999/reviews" -f event=APPROVE -f body=x
+reaches_gh "graphql resolveReviewThread"    api graphql -f 'query=mutation { resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } } }'
+reaches_gh "pr review --approve"            pr review 999999 --repo "$R" --approve --body 'LGTM'
+reaches_gh "REST POST --input <file>"       api "repos/$R/pulls/999999/reviews" --method POST --input "$TMP/review.json"
 
 echo "MUST BLOCK - subcommands:"
 check BLOCKED "pr merge"                    pr merge 5 --repo "$R"
@@ -108,11 +144,23 @@ check allowed "run list (read verb)"        run list --repo "$R" --limit 1
 check allowed "graphql read query"          api graphql -f 'query={viewer{login}}'
 check allowed "graphql resolveReviewThread" api graphql -f 'query=mutation { resolveReviewThread(input:{threadId:"PRRT_bogus"}) { thread { isResolved } } }'
 check allowed "graphql addReviewThread"     api graphql -f 'query=mutation { addPullRequestReviewThread(input:{}) { thread { id } } }'
+# The mutation carries the comment body inside it, and a review comment
+# nearly always names a function. `input:{}` above is the one shape of this
+# mutation that cannot trip the field extractor, so it proves nothing on its
+# own - these two pin it. The second also names a *denied* mutation inside
+# the body, which is data and must not be read as a call.
+check allowed "review body with parens"     api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"check() reads the wrong exit code"}) { thread { id } } }'
+check allowed "review body naming a merge"  api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"call mergePullRequest(input:{}) here"}) { thread { id } } }'
 check allowed "graphql named op + variable" api graphql -F threadId=x -f 'query=mutation Resolve($threadId: ID!) { resolveReviewThread(input:{threadId:$threadId}) { thread { isResolved } } }'
 check allowed "POST a review (approve)"     api -X POST "repos/$R/pulls/999999/reviews" -f event=APPROVE -f body=x
 check allowed "POST a review comment"       api -X POST "repos/$R/pulls/999999/comments" -f body=x
 check allowed "PATCH own review comment"    api -X PATCH "repos/$R/pulls/comments/1" -f body=x
 check allowed "POST an issue comment"       api -X POST "repos/$R/issues/999999/comments" -f body=x
+# A REST body is not a graphql query. review.json mentions a mutation and
+# contains `name(`; if the graphql scanner ever sees a REST body again,
+# these two fail. This is how review payloads are actually posted.
+check allowed "REST POST --input <file>"    api "repos/$R/pulls/999999/reviews" --method POST --input "$TMP/review.json"
+check allowed "REST POST --input - (stdin)" api "repos/$R/pulls/999999/reviews" --method POST --input -
 check allowed "pr comment w/ merge in body" pr comment 999999 --repo "$R" --body 'we should call mergePullRequest here'
 check allowed "pr review --approve"         pr review 999999 --repo "$R" --approve --body 'LGTM'
 
