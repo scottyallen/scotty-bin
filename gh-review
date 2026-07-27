@@ -259,7 +259,21 @@ if [ "${1:-}" = "api" ]; then
         # including a following TOP-LEVEL `mergePullRequest(`, which is not
         # inside any string and would have executed. That was a verified
         # fail-open, not a theoretical one; don't collapse these terms.
-        qscan="$(printf '%s' "$qbody" | sed -E 's/\\\\//g; s/\\"//g; s/"[^"]*"//g')"
+        #
+        # The trailing `tr` is the fourth load-bearing term. `grep` matches
+        # one line at a time, so `[[:space:]]` never spans a newline - and
+        # GraphQL happily allows one between a field name and its argument
+        # list. `mergePullRequest\n(input:...)` therefore matched NOTHING:
+        # the name line has no `(`, the `(` line has no name, and the field
+        # was dropped from the list SILENTLY rather than failing to parse.
+        # The die-on-empty below hides that only when nothing at all parses;
+        # one allow-listed neighbour with its `name(` intact re-opens the
+        # door and the merge sails through. Confirmed at the server, not
+        # inferred: GitHub dispatched `mergePullRequest` and returned
+        # NOT_FOUND on the deliberately-bogus node id. Folding newlines to
+        # spaces before extraction is what makes `[[:space:]]` mean what
+        # this code always assumed it meant.
+        qscan="$(printf '%s' "$qbody" | sed -E 's/\\\\//g; s/\\"//g; s/"[^"]*"//g' | tr '\n' ' ')"
         mutations="$(printf '%s' "$qscan" | grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' | sed -E 's/[[:space:]]*\($//')"
         [ -z "$mutations" ] && die "refusing a graphql mutation whose fields could not be parsed - refusing rather than guessing."
         for m in $mutations; do

@@ -140,6 +140,31 @@ check BLOCKED "merge past a \\\\ desync"      api graphql -f 'query=mutation { a
 check BLOCKED "merge past 2nd field, plain" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
 check BLOCKED "graphql aliased merge"       api graphql -f 'query=mutation { m: mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
 check BLOCKED "graphql merge, no whitespace" api graphql -f 'query=mutation{mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}}'
+# Newline between a field name and its `(`. grep matches per line, so
+# `[[:space:]]` cannot span one: the name line has no `(` and the `(` line has
+# no name, so extraction dropped the field SILENTLY. Needs an allow-listed
+# neighbour - alone it fails closed on the die-on-empty, which is exactly what
+# made this hide. Confirmed at the server before the fix (GitHub dispatched
+# mergePullRequest and returned NOT_FOUND on the bogus node id).
+check BLOCKED "merge, newline before its (" api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{body:"hi"}) { thread { id } }
+  mergePullRequest
+  (input:{pullRequestId:"x"}) { clientMutationId }
+}'
+check BLOCKED "merge alone, newline before (" api graphql -f 'query=mutation {
+  mergePullRequest
+  (input:{pullRequestId:"x"}) { clientMutationId }
+}'
+check BLOCKED "createCommitOnBranch, newline" api graphql -f 'query=mutation {
+  resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } }
+  createCommitOnBranch
+  (input:{}) { commit { oid } }
+}'
+check BLOCKED "deleteRef, newline before ("  api graphql -f 'query=mutation {
+  resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } }
+  deleteRef
+  (input:{refId:"x"}) { clientMutationId }
+}'
 
 echo "MUST ALLOW:"
 check allowed "GET user"                    api user
@@ -164,6 +189,16 @@ check allowed "review body naming a merge"  api graphql -f 'query=mutation { add
 check allowed "body ending in \\\\"          api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"the path is C:\\"}) { thread { id } } }'
 check allowed "body with escaped quote"     api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"he said \"check() is wrong\" here"}) { thread { id } } }'
 check allowed "graphql named op + variable" api graphql -F threadId=x -f 'query=mutation Resolve($threadId: ID!) { resolveReviewThread(input:{threadId:$threadId}) { thread { isResolved } } }'
+# The newline fold must not over-block. This is the shape a real reviewer
+# actually emits: a pretty-printed multi-line mutation whose comment body is
+# prose ABOUT merging and contains parens. Only the two review mutations may
+# be extracted from it.
+check allowed "multi-line review, merge in body" api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{
+    body:"check() drops the code here, and mergePullRequest(input:{}) would be wrong"
+  }) { thread { id } }
+  resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } }
+}'
 check allowed "POST a review (approve)"     api -X POST "repos/$R/pulls/999999/reviews" -f event=APPROVE -f body=x
 check allowed "POST a review comment"       api -X POST "repos/$R/pulls/999999/comments" -f body=x
 check allowed "PATCH own review comment"    api -X PATCH "repos/$R/pulls/comments/1" -f body=x
