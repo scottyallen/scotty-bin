@@ -132,6 +132,14 @@ check BLOCKED "graphql deleteRef"           api graphql -f 'query=mutation { del
 check BLOCKED "graphql mergeBranch"         api graphql -f 'query=mutation { mergeBranch(input:{}) { mergeCommit { oid } } }'
 check BLOCKED "graphql markPRReadyForReview" api graphql -f 'query=mutation { markPullRequestReadyForReview(input:{}) { clientMutationId } }'
 check BLOCKED "graphql unknown mutation"    api graphql -f 'query=mutation { someMutationNobodyAllowListed(input:{}) { id } }'
+# Literal-stripping desync. The `\\` is an escaped backslash, so the quote
+# after it really does end the string - a merge following it is TOP-LEVEL,
+# not inside a literal. If the escaped-backslash term is ever dropped from
+# the sed, the opening quote binds further along and swallows this merge.
+check BLOCKED "merge past a \\\\ desync"      api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"a\\"}) { thread { id } } mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "merge past 2nd field, plain" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "graphql aliased merge"       api graphql -f 'query=mutation { m: mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "graphql merge, no whitespace" api graphql -f 'query=mutation{mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}}'
 
 echo "MUST ALLOW:"
 check allowed "GET user"                    api user
@@ -151,6 +159,10 @@ check allowed "graphql addReviewThread"     api graphql -f 'query=mutation { add
 # the body, which is data and must not be read as a call.
 check allowed "review body with parens"     api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"check() reads the wrong exit code"}) { thread { id } } }'
 check allowed "review body naming a merge"  api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"call mergePullRequest(input:{}) here"}) { thread { id } } }'
+# The desync fix must not over-block: a body legitimately ending in an
+# escaped backslash, and one containing an escaped quote, both still post.
+check allowed "body ending in \\\\"          api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"the path is C:\\"}) { thread { id } } }'
+check allowed "body with escaped quote"     api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"he said \"check() is wrong\" here"}) { thread { id } } }'
 check allowed "graphql named op + variable" api graphql -F threadId=x -f 'query=mutation Resolve($threadId: ID!) { resolveReviewThread(input:{threadId:$threadId}) { thread { isResolved } } }'
 check allowed "POST a review (approve)"     api -X POST "repos/$R/pulls/999999/reviews" -f event=APPROVE -f body=x
 check allowed "POST a review comment"       api -X POST "repos/$R/pulls/999999/comments" -f body=x

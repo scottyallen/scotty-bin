@@ -248,9 +248,18 @@ if [ "${1:-}" = "api" ]; then
         # nearly always names a function - without this, a body reading
         # "check() returns the wrong code" is refused as a mutation called
         # `check`. A name inside a string is data and cannot execute, so
-        # dropping literals costs no safety. Escaped quotes go first so they
-        # can't throw off the pairing.
-        qscan="$(printf '%s' "$qbody" | sed -E 's/\\"//g; s/"[^"]*"//g')"
+        # dropping literals costs no safety.
+        #
+        # The order of the three terms is load-bearing. Escaped BACKSLASHES
+        # go first, then escaped quotes, then paired literals. Without the
+        # first term, `body:"a\\"` desyncs the pairing: the `\\` is an
+        # escaped backslash, so the quote after it is a REAL terminator, but
+        # a lone `s/\\"//g` eats it as an escaped quote. The opening quote
+        # then binds to some later quote and everything between is deleted -
+        # including a following TOP-LEVEL `mergePullRequest(`, which is not
+        # inside any string and would have executed. That was a verified
+        # fail-open, not a theoretical one; don't collapse these terms.
+        qscan="$(printf '%s' "$qbody" | sed -E 's/\\\\//g; s/\\"//g; s/"[^"]*"//g')"
         mutations="$(printf '%s' "$qscan" | grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' | sed -E 's/[[:space:]]*\($//')"
         [ -z "$mutations" ] && die "refusing a graphql mutation whose fields could not be parsed - refusing rather than guessing."
         for m in $mutations; do
