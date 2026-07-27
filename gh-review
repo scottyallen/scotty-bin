@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+#
+# gh-review - run `gh` as the strangeparts-reviewer machine account.
+#
+# Every GitHub write a review agent makes (comments, review submissions,
+# thread resolution, approvals) goes through this wrapper instead of bare
+# `gh`. Bare `gh` authenticates as scottyallen - the PR AUTHOR - which is
+# what made author and reviewer indistinguishable in the first place and
+# forced the LGTM-comment workaround: GitHub refuses to let an account
+# approve its own PR. With a distinct identity the reviewer posts a real
+# APPROVED review, and the merge gate becomes a structural check instead of
+# a grep for the string "LGTM".
+#
+# The identity is carried by the token, not by a convention an agent has to
+# remember. Forgetting the wrapper is a VISIBLE failure (the review posts as
+# Scotty and no APPROVE appears), never a silent one.
+#
+# ---------------------------------------------------------------------------
+# AUTHORIZATION MODEL - read this before loosening anything below.
+#
+# strangeparts-reviewer is a *Write* collaborator on the ~22 repos that see
+# PR flow. Write is not what the reviewer lane needs; it is the floor GitHub
+# imposes, because `resolveReviewThread` requires it (measured 2026-07-27:
+# Read and Triage both return FORBIDDEN for that mutation, while both can
+# comment inline and submit a real APPROVE). Scotty chose Write over losing
+# thread resolution.
+#
+# The consequence: GitHub is NO LONGER the boundary. A Write collaborator
+# can push branches and merge pull requests, so this blocklist is the only
+# thing between a confused reviewer agent and merging its own approval -
+# which is the exact failure the author/reviewer split exists to prevent.
+# Treat the deny lists as load-bearing security code, not hygiene. Anything
+# added to the allow side needs the same scrutiny as a production change.
+#
+# Known gap, stated honestly: this wraps `gh`, not `git`. Nothing here stops
+# a caller that reads GH_REVIEWER_TOKEN itself and pushes with it. The guard
+# is against confusion, not against a determined caller.
+# ---------------------------------------------------------------------------
+#
+# Usage: gh-review <any gh subcommand and args>
+#   gh-review pr review 12 --repo strangeparts/marionette --approve --body '...'
+#   gh-review pr comment 12 --repo strangeparts/marionette --body '...'
+#   gh-review api graphql -f query='mutation { resolveReviewThread(...) }'
+#
+# Adding a repo (the account only sees repos it was invited to):
+#   gh api -X PUT repos/<owner>/<repo>/collaborators/strangeparts-reviewer -f permission=push
+#   (existing collaborators update in place; a brand-new one must accept:
+#    GH_TOKEN=$(pa-secrets get GH_REVIEWER_TOKEN) gh api --paginate user/repository_invitations \
+#      --jq '.[].id' | while read -r i; do
+#        GH_TOKEN=$(pa-secrets get GH_REVIEWER_TOKEN) gh api -X PATCH "user/repository_invitations/$i" --silent
+#      done)
+
+set -uo pipefail
+
+REVIEWER_LOGIN="strangeparts-reviewer"
+
+die() { echo "gh-review: $*" >&2; exit 3; }
+
+if [ $# -eq 0 ]; then
+  echo "gh-review: usage: gh-review <gh subcommand> [args...]" >&2
+  echo "           runs gh as $REVIEWER_LOGIN instead of scottyallen" >&2
+  exit 2
+fi
+
+# --- Guard 1: subcommands outside the review lane. Matched on the leading
+# subcommand pair, so a --body containing the word "merge" can't trip it.
+case "${1:-} ${2:-}" in
+  "pr merge"|"pr close"|"pr reopen"|"pr ready"|"pr create"|"pr edit"|"pr checkout")
+    die "refusing '$1 $2' - the reviewer reviews; it does not merge, close, or author PRs." ;;
+  "repo delete"|"repo archive"|"repo rename"|"repo edit"|"repo fork"|"repo sync")
+    die "refusing '$1 $2' - repo administration is not in the review lane." ;;
+  "release "*|"workflow "*|"secret "*|"variable "*|"ssh-key "*|"gpg-key "*|"auth "*)
+    die "refusing '$1 $2' - not in the review lane." ;;
+esac
+
+# --- Guard 2: `gh api` can reach anything the token can, so inspect it.
+# Reads are unrestricted (the reviewer must read diffs, trees, runs, refs);
+# only write methods are filtered, against an explicit path deny list. This
+# split is deliberate: `git/commits/<sha>` is a GET the reviewer genuinely
+# needs (the tree-SHA equality check that decides whether a force-push was a
+# real content change), while a POST to the same path creates a commit.
+if [ "${1:-}" = "api" ]; then
+  method="GET"; path=""; graphql=""; prev=""
+  for a in "$@"; do
+    case "$prev" in
+      -X|--method) method="$(printf '%s' "$a" | tr '[:lower:]' '[:upper:]')" ;;
+      -f|-F|--field|--raw-field)
+        # Only the GraphQL query field is scanned. A review --body may
+        # legitimately discuss mergePullRequest without being a merge.
+        case "$a" in query=*) graphql="$graphql $a" ;; esac ;;
+    esac
+    case "$a" in
+      -X*) [ "$a" != "-X" ] && method="$(printf '%s' "${a#-X}" | tr '[:lower:]' '[:upper:]')" ;;
+    esac
+    # First bare word after `api` that isn't a flag's value is the path.
+    case "$prev" in
+      -X|--method|-f|-F|--field|--raw-field|-H|--header|--jq|-q|-t|--template|--cache|--hostname|-i|--input) ;;
+      *) case "$a" in
+           -*|api) ;;
+           *) [ -z "$path" ] && path="$a" ;;
+         esac ;;
+    esac
+    prev="$a"
+  done
+
+  # gh defaults to POST once any -f/-F field is present.
+  if [ "$method" = "GET" ] && [ -n "$graphql" ]; then method="POST"; fi
+
+  case "$method" in
+    POST|PUT|PATCH|DELETE)
+      case "$path" in
+        *pulls/*/merge*|*/merges|*/merges/*)
+          die "refusing a $method to '$path' - merging is Scotty's call, not the reviewer's." ;;
+        *git/refs*|*git/commits*|*git/trees*|*git/blobs*|*git/tags*)
+          die "refusing a $method to '$path' - that writes git objects/refs (a push by another name)." ;;
+        *contents/*)
+          die "refusing a $method to '$path' - that creates, edits, or deletes repository files." ;;
+        *actions/*|*/deployments*|*/pages*|*/releases*)
+          die "refusing a $method to '$path' - CI, deploys, and releases are outside the review lane." ;;
+        *collaborators*|*branches/*protection*|*/rulesets*|*/teams*)
+          die "refusing a $method to '$path' - access control is not the reviewer's to change." ;;
+      esac ;;
+  esac
+
+  # GraphQL mutations that merge, push, or close, by any other name.
+  if [ -n "$graphql" ]; then
+    case "$graphql" in
+      *mergePullRequest*|*enablePullRequestAutoMerge*)
+        die "refusing a merge mutation - merging is Scotty's call, not the reviewer's." ;;
+      *createCommitOnBranch*|*createRef*|*deleteRef*|*updateRef*)
+        die "refusing a ref/commit mutation - that is a push by another name." ;;
+      *closePullRequest*|*reopenPullRequest*|*deleteBranch*)
+        die "refusing a PR lifecycle mutation - the reviewer comments and approves only." ;;
+    esac
+  fi
+fi
+
+TOKEN="$(pa-secrets get GH_REVIEWER_TOKEN 2>/dev/null)" || TOKEN=""
+if [ -z "$TOKEN" ]; then
+  echo "gh-review: GH_REVIEWER_TOKEN is not in the pa secret store." >&2
+  echo "           Mint a classic PAT (scope: repo) on the $REVIEWER_LOGIN account," >&2
+  echo "           then in a real Terminal: pa-secrets add GH_REVIEWER_TOKEN" >&2
+  exit 4
+fi
+
+# gh reads GH_TOKEN first and GITHUB_TOKEN second; clear the latter so an
+# inherited author token can never win and post under the wrong identity.
+unset GITHUB_TOKEN
+export GH_TOKEN="$TOKEN"
+
+exec gh "$@"
