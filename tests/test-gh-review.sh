@@ -140,6 +140,77 @@ check BLOCKED "merge past a \\\\ desync"      api graphql -f 'query=mutation { a
 check BLOCKED "merge past 2nd field, plain" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
 check BLOCKED "graphql aliased merge"       api graphql -f 'query=mutation { m: mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
 check BLOCKED "graphql merge, no whitespace" api graphql -f 'query=mutation{mergePullRequest(input:{pullRequestId:"x"}){clientMutationId}}'
+# Newline between a field name and its `(`. grep matches per line, so
+# `[[:space:]]` cannot span one: the name line has no `(` and the `(` line has
+# no name, so extraction dropped the field SILENTLY. Needs an allow-listed
+# neighbour - alone it fails closed on the die-on-empty, which is exactly what
+# made this hide. Confirmed at the server before the fix (GitHub dispatched
+# mergePullRequest and returned NOT_FOUND on the bogus node id).
+check BLOCKED "merge, newline before its (" api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{body:"hi"}) { thread { id } }
+  mergePullRequest
+  (input:{pullRequestId:"x"}) { clientMutationId }
+}'
+check BLOCKED "merge alone, newline before (" api graphql -f 'query=mutation {
+  mergePullRequest
+  (input:{pullRequestId:"x"}) { clientMutationId }
+}'
+check BLOCKED "createCommitOnBranch, newline" api graphql -f 'query=mutation {
+  resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } }
+  createCommitOnBranch
+  (input:{}) { commit { oid } }
+}'
+check BLOCKED "deleteRef, newline before ("  api graphql -f 'query=mutation {
+  resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } }
+  deleteRef
+  (input:{refId:"x"}) { clientMutationId }
+}'
+# The other Ignored tokens. GraphQL treats Comma and Comment as separators
+# exactly like whitespace, so each splits `name` from `(` the same way the
+# newline did. Every row below was confirmed DISPATCHED before the fix.
+check BLOCKED "merge, comma before its ("   api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest,(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "merge, spaced comma"         api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest , (input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "merge, doubled comma"        api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest,,(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "merge, aliased + comma"      api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } m: mergePullRequest,(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "deleteRef, comma before ("   api graphql -f 'query=mutation { resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } } deleteRef,(input:{refId:"x"}) { clientMutationId } }'
+# Comment cases. A bare `#` or one ending in punctuation leaves nothing for
+# the extractor to mis-read, which is precisely why it sailed through.
+check BLOCKED "merge, bare # comment"       api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{body:"hi"}) { thread { id } }
+  mergePullRequest #
+  (input:{pullRequestId:"x"}) { clientMutationId }
+}'
+check BLOCKED "merge, # comment w/ punct"   api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{body:"hi"}) { thread { id } }
+  mergePullRequest # see [1]
+  (input:{pullRequestId:"x"}) { clientMutationId }
+}'
+# The name-alone backstop: even with NO `(` anywhere near it, a denied name
+# sitting in executable text is refused. This is the net under the extractor
+# - if a future Ignored-token trick defeats parsing again, it fails closed.
+check BLOCKED "denied name, no call syntax" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } mergePullRequest }'
+# These two pin the NORMALIZATION on its own. The rows above are caught by
+# either layer, so they pass even with the separator handling reverted (the
+# name backstop picks them up) - they pin the guard as a whole, not this
+# step. An unknown mutation is on neither the allow list nor the deny list,
+# so ONLY correct separator handling can surface it: revert the comma fold
+# or the comment strip and these two flip to allowed.
+check BLOCKED "unknown mutation, comma sep" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } someMutationNobodyAllowListed,(input:{}) { id } }'
+# Block strings. `s/"[^"]*"//g` pairs quotes two at a time, so a """..."""
+# holding a bare `"` leaves an odd quote that binds to the next quote in the
+# query - which a real merge supplies itself in `pullRequestId:"x"` - and
+# everything between is deleted. The denied name is then GONE from $qscan,
+# so the extractor AND the name backstop both see a clean query. That is why
+# block strings are refused upstream of the strip rather than parsed.
+# Pre-existing: these dispatched on master and on both earlier commits here.
+check BLOCKED "block string hides a merge"  api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"""a"b"""}) { thread { id } } mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "block string hides deleteRef" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"""a"b"""}) { thread { id } } deleteRef(input:{refId:"x"}) { clientMutationId } }'
+check BLOCKED "block string, otherwise benign" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"""just a block string"""}) { thread { id } } }'
+check BLOCKED "unknown mutation, # comment" api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{body:"hi"}) { thread { id } }
+  someMutationNobodyAllowListed #
+  (input:{}) { id }
+}'
 
 echo "MUST ALLOW:"
 check allowed "GET user"                    api user
@@ -164,6 +235,35 @@ check allowed "review body naming a merge"  api graphql -f 'query=mutation { add
 check allowed "body ending in \\\\"          api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"the path is C:\\"}) { thread { id } } }'
 check allowed "body with escaped quote"     api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"he said \"check() is wrong\" here"}) { thread { id } } }'
 check allowed "graphql named op + variable" api graphql -F threadId=x -f 'query=mutation Resolve($threadId: ID!) { resolveReviewThread(input:{threadId:$threadId}) { thread { isResolved } } }'
+# The newline fold must not over-block. This is the shape a real reviewer
+# actually emits: a pretty-printed multi-line mutation whose comment body is
+# prose ABOUT merging and contains parens. Only the two review mutations may
+# be extracted from it.
+check allowed "multi-line review, merge in body" api graphql -f 'query=mutation {
+  addPullRequestReviewThread(input:{
+    body:"check() drops the code here, and mergePullRequest(input:{}) would be wrong"
+  }) { thread { id } }
+  resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } }
+}'
+# The comment strip and comma fold must not over-block the reviewer's own
+# output. A review body routinely contains `#` (issue refs) and commas, and
+# the argument list itself is comma-separated - none of that may be read as
+# a separator hiding a call, because literals are stripped first.
+check allowed "body with # issue refs"      api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"see PR #6 and issue #12, check() is wrong"}) { thread { id } } }'
+check allowed "body with a bare # at end"   api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"the marker is #"}) { thread { id } } }'
+check allowed "comma-separated arguments"   api graphql -f 'query=mutation { addPullRequestReviewThread(input:{pullRequestId:"a", body:"b", path:"c", line:1}) { thread { id } } }'
+# The backstop keys on the NAME, so a name that merely CONTAINS a denied one
+# must not trip it. To pin that, the substring has to survive to $qscan -
+# i.e. sit OUTSIDE a string literal, since literals are stripped on the way
+# there. An alias is the natural place, and the one shape this file already
+# treats as first-class (see `graphql aliased merge`). Swap the word match
+# `*" $denied "*` for a bare `*"$denied"*` and this row flips to blocked.
+check allowed "denied name as alias substring" api graphql -f 'query=mutation { mergePullRequestIdent: resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } } }'
+# Kept alongside it, but note what this one does and does not show: the
+# fixture is a `body:` value, so it is stripped before the backstop runs and
+# passes under either match. It documents that a merge-ish name in review
+# prose is safe - it is NOT what pins the word boundary.
+check allowed "merge-ish name in review prose" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"mergePullRequestId is the arg"}) { thread { id } } }'
 check allowed "POST a review (approve)"     api -X POST "repos/$R/pulls/999999/reviews" -f event=APPROVE -f body=x
 check allowed "POST a review comment"       api -X POST "repos/$R/pulls/999999/comments" -f body=x
 check allowed "PATCH own review comment"    api -X PATCH "repos/$R/pulls/comments/1" -f body=x
