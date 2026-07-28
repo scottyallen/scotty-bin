@@ -282,6 +282,21 @@ if [ "${1:-}" = "api" ]; then
         # gone and cannot eat the rest of the line; and `sed` being
         # line-oriented makes `s/#.*$//` exactly the spec's "comment runs to
         # the LineTerminator", which is why it must precede the fold.
+        # Block strings are refused outright, BEFORE any of the above. The
+        # literal strip pairs quotes two at a time, so a `"""..."""` holding
+        # a bare `"` leaves an odd quote that binds to the next quote in the
+        # query and deletes everything between - and a real merge carries
+        # that next quote itself, in `pullRequestId:"x"`. The denied name is
+        # then not merely hidden from `name(` matching, it is GONE from the
+        # scan text, which defeats the name backstop below as well since
+        # both read `$qscan`. Refusing costs the review lane nothing: every
+        # body it posts is an ordinary quoted string, and nothing in the
+        # test suite needs one.
+        case "$qtext" in
+          *'"""'*)
+            die "refusing a graphql mutation containing a block string (\"\"\") - it desyncs the string-literal stripper, which would hide a denied field from BOTH the extractor and the name backstop." ;;
+        esac
+
         qscan="$(printf '%s' "$qbody" \
           | sed -E 's/\\\\//g; s/\\"//g; s/"[^"]*"//g; s/#.*$//' \
           | LC_ALL=C sed -E 's/\xef\xbb\xbf/ /g' \
@@ -289,20 +304,33 @@ if [ "${1:-}" = "api" ]; then
         mutations="$(printf '%s' "$qscan" | grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' | sed -E 's/[[:space:]]*\($//')"
         [ -z "$mutations" ] && die "refusing a graphql mutation whose fields could not be parsed - refusing rather than guessing."
 
-        # Backstop, independent of the extraction above. Twice now a denied
-        # field has slipped past because some separator hid it from `name(`
-        # matching; both times the name was still sitting there in plain
-        # sight in the executable text. So: refuse on the NAME alone,
-        # wherever it appears, without requiring it to parse as a call.
+        # Backstop against the EXTRACTOR, not against the pipeline. Twice a
+        # denied field slipped past because a separator hid it from `name(`
+        # matching; both times the name was still sitting in plain sight in
+        # the executable text. So: refuse on the NAME alone, wherever it
+        # appears, without requiring it to parse as a call.
+        #
+        # Be precise about what this does and does not cover, because the
+        # tempting overstatement ("so any future parsing trick now fails
+        # closed") is false and would get disproved late and quietly:
+        #
+        #   COVERED - anything that stops the name from matching `name(`
+        #   while leaving the name in `$qscan`: an unnormalised separator, a
+        #   missing paren, an alias, a formatting shape nobody predicted.
+        #
+        #   NOT COVERED - anything that removes the name from `$qscan`
+        #   itself. This reads the SAME post-strip text the extractor does,
+        #   so it inherits every weakness of the strip. A block string
+        #   desyncing the quote pairing deletes the name outright and both
+        #   layers see a clean query - which is exactly why block strings
+        #   are refused above, before the strip runs. These two are layered,
+        #   not independent; keep that upstream refusal.
         #
         # This cannot false-positive on a review body discussing a merge -
-        # string literals are already stripped from `$qscan` above, so a
-        # bare denied name surviving to here is never data. It is a strict
+        # string literals are already stripped from `$qscan`, so a bare
+        # denied name surviving to here is never data. It is a strict
         # widening of the deny half only; the allow list still gates
         # everything else, so this adds no new ability to permit.
-        #
-        # If a future Ignored-token trick defeats the extractor again, this
-        # turns it into a refusal instead of a silent bypass.
         for denied in mergePullRequest enablePullRequestAutoMerge mergeBranch \
                       createCommitOnBranch createRef deleteRef updateRef \
                       closePullRequest reopenPullRequest deleteBranch; do

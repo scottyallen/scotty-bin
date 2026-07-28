@@ -196,6 +196,16 @@ check BLOCKED "denied name, no call syntax" api graphql -f 'query=mutation { add
 # so ONLY correct separator handling can surface it: revert the comma fold
 # or the comment strip and these two flip to allowed.
 check BLOCKED "unknown mutation, comma sep" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"hi"}) { thread { id } } someMutationNobodyAllowListed,(input:{}) { id } }'
+# Block strings. `s/"[^"]*"//g` pairs quotes two at a time, so a """..."""
+# holding a bare `"` leaves an odd quote that binds to the next quote in the
+# query - which a real merge supplies itself in `pullRequestId:"x"` - and
+# everything between is deleted. The denied name is then GONE from $qscan,
+# so the extractor AND the name backstop both see a clean query. That is why
+# block strings are refused upstream of the strip rather than parsed.
+# Pre-existing: these dispatched on master and on both earlier commits here.
+check BLOCKED "block string hides a merge"  api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"""a"b"""}) { thread { id } } mergePullRequest(input:{pullRequestId:"x"}) { clientMutationId } }'
+check BLOCKED "block string hides deleteRef" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"""a"b"""}) { thread { id } } deleteRef(input:{refId:"x"}) { clientMutationId } }'
+check BLOCKED "block string, otherwise benign" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"""just a block string"""}) { thread { id } } }'
 check BLOCKED "unknown mutation, # comment" api graphql -f 'query=mutation {
   addPullRequestReviewThread(input:{body:"hi"}) { thread { id } }
   someMutationNobodyAllowListed #
