@@ -253,9 +253,17 @@ check allowed "body with # issue refs"      api graphql -f 'query=mutation { add
 check allowed "body with a bare # at end"   api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"the marker is #"}) { thread { id } } }'
 check allowed "comma-separated arguments"   api graphql -f 'query=mutation { addPullRequestReviewThread(input:{pullRequestId:"a", body:"b", path:"c", line:1}) { thread { id } } }'
 # The backstop keys on the NAME, so a name that merely CONTAINS a denied one
-# must not trip it - this is the false-positive that a substring match would
-# cause and a word match must not.
-check allowed "allow-listed name, merge-ish substring" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"mergePullRequestId is the arg"}) { thread { id } } }'
+# must not trip it. To pin that, the substring has to survive to $qscan -
+# i.e. sit OUTSIDE a string literal, since literals are stripped on the way
+# there. An alias is the natural place, and the one shape this file already
+# treats as first-class (see `graphql aliased merge`). Swap the word match
+# `*" $denied "*` for a bare `*"$denied"*` and this row flips to blocked.
+check allowed "denied name as alias substring" api graphql -f 'query=mutation { mergePullRequestIdent: resolveReviewThread(input:{threadId:"x"}) { thread { isResolved } } }'
+# Kept alongside it, but note what this one does and does not show: the
+# fixture is a `body:` value, so it is stripped before the backstop runs and
+# passes under either match. It documents that a merge-ish name in review
+# prose is safe - it is NOT what pins the word boundary.
+check allowed "merge-ish name in review prose" api graphql -f 'query=mutation { addPullRequestReviewThread(input:{body:"mergePullRequestId is the arg"}) { thread { id } } }'
 check allowed "POST a review (approve)"     api -X POST "repos/$R/pulls/999999/reviews" -f event=APPROVE -f body=x
 check allowed "POST a review comment"       api -X POST "repos/$R/pulls/999999/comments" -f body=x
 check allowed "PATCH own review comment"    api -X PATCH "repos/$R/pulls/comments/1" -f body=x
