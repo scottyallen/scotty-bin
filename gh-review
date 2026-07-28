@@ -260,22 +260,57 @@ if [ "${1:-}" = "api" ]; then
         # inside any string and would have executed. That was a verified
         # fail-open, not a theoretical one; don't collapse these terms.
         #
-        # The trailing `tr` is the fourth load-bearing term. `grep` matches
-        # one line at a time, so `[[:space:]]` never spans a newline - and
-        # GraphQL happily allows one between a field name and its argument
-        # list. `mergePullRequest\n(input:...)` therefore matched NOTHING:
-        # the name line has no `(`, the `(` line has no name, and the field
-        # was dropped from the list SILENTLY rather than failing to parse.
-        # The die-on-empty below hides that only when nothing at all parses;
-        # one allow-listed neighbour with its `name(` intact re-opens the
-        # door and the merge sails through. Confirmed at the server, not
-        # inferred: GitHub dispatched `mergePullRequest` and returned
-        # NOT_FOUND on the deliberately-bogus node id. Folding newlines to
-        # spaces before extraction is what makes `[[:space:]]` mean what
-        # this code always assumed it meant.
-        qscan="$(printf '%s' "$qbody" | sed -E 's/\\\\//g; s/\\"//g; s/"[^"]*"//g' | tr '\n' ' ')"
+        # The comment-strip and the `tr` normalise GraphQL's *Ignored* tokens,
+        # and they are load-bearing for the same reason as the sed terms.
+        # `grep` matches one line at a time and `[[:space:]]` matches only
+        # whitespace - but the spec lets a whole CLASS of tokens sit between
+        # a field name and its argument list: WhiteSpace, LineTerminator,
+        # Comma, Comment, UnicodeBOM. Any of them that isn't normalised here
+        # splits `name` from `(` so the pattern matches NOTHING, and the
+        # field is dropped from the list SILENTLY rather than failing to
+        # parse. The die-on-empty below hides that whenever anything else
+        # parses: one allow-listed neighbour re-opens the door.
+        #
+        # Two rounds of this bug, each a different token of the same class:
+        # `mergePullRequest\n(input:...)` was confirmed at the server (GitHub
+        # dispatched it, NOT_FOUND on a bogus node id), and `,` / `#` were
+        # then confirmed the same way on the fix for it. Do not "simplify"
+        # this to the one separator you happen to be thinking about.
+        #
+        # Order matters and already works in our favour: string literals are
+        # stripped BEFORE `s/#.*$//`, so a `#` inside a review body is long
+        # gone and cannot eat the rest of the line; and `sed` being
+        # line-oriented makes `s/#.*$//` exactly the spec's "comment runs to
+        # the LineTerminator", which is why it must precede the fold.
+        qscan="$(printf '%s' "$qbody" \
+          | sed -E 's/\\\\//g; s/\\"//g; s/"[^"]*"//g; s/#.*$//' \
+          | LC_ALL=C sed -E 's/\xef\xbb\xbf/ /g' \
+          | tr '\n\r\t,' '    ')"
         mutations="$(printf '%s' "$qscan" | grep -oE '[A-Za-z_][A-Za-z0-9_]*[[:space:]]*\(' | sed -E 's/[[:space:]]*\($//')"
         [ -z "$mutations" ] && die "refusing a graphql mutation whose fields could not be parsed - refusing rather than guessing."
+
+        # Backstop, independent of the extraction above. Twice now a denied
+        # field has slipped past because some separator hid it from `name(`
+        # matching; both times the name was still sitting there in plain
+        # sight in the executable text. So: refuse on the NAME alone,
+        # wherever it appears, without requiring it to parse as a call.
+        #
+        # This cannot false-positive on a review body discussing a merge -
+        # string literals are already stripped from `$qscan` above, so a
+        # bare denied name surviving to here is never data. It is a strict
+        # widening of the deny half only; the allow list still gates
+        # everything else, so this adds no new ability to permit.
+        #
+        # If a future Ignored-token trick defeats the extractor again, this
+        # turns it into a refusal instead of a silent bypass.
+        for denied in mergePullRequest enablePullRequestAutoMerge mergeBranch \
+                      createCommitOnBranch createRef deleteRef updateRef \
+                      closePullRequest reopenPullRequest deleteBranch; do
+          case " $(printf '%s' "$qscan" | tr -c 'A-Za-z0-9_' ' ') " in
+            *" $denied "*)
+              die "refusing graphql '$denied' - the name appears in the executable query text. Merging, pushing, and PR lifecycle are not the reviewer's to change." ;;
+          esac
+        done
         for m in $mutations; do
           case "$m" in
             mergePullRequest|enablePullRequestAutoMerge|mergeBranch)
